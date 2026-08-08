@@ -1,0 +1,26 @@
+[project]
+name = "tiny-pi0"
+version = "0.1.0"
+description = "A configuration-scalable PyTorch reproduction of pi0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "einops==0.8.1",
+    "numpy>=1.26,<2.0",
+    "pillow>=11.0",
+    "safetensors>=0.5",
+    "torch==2.7.1",
+    "tyro>=0.9.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
