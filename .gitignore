@@ -1,0 +1,41 @@
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Model weights and training outputs
+checkpoints/
+outputs/
+runs/
+wandb/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+
+# Local datasets and Hugging Face caches
+data/
+datasets/
+.cache/
+huggingface/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
