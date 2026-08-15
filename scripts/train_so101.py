@@ -35,6 +35,10 @@ class Args:
     max_steps: int = 30_000
     micro_batch_size: int = 8
     gradient_accumulation_steps: int = 4
+    learning_rate: float = 2.5e-5
+    end_learning_rate: float = 2.5e-6
+    warmup_steps: int = 1_000
+    decay_steps: int | None = None
     num_workers: int = 4
     validation_fraction: float = 0.1
     validation_interval: int = 500
@@ -88,6 +92,10 @@ def main(args: Args) -> None:
         max_steps=args.max_steps,
         micro_batch_size=args.micro_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
+        end_learning_rate=args.end_learning_rate,
+        warmup_steps=args.warmup_steps,
+        decay_steps=args.max_steps if args.decay_steps is None else args.decay_steps,
         num_workers=args.num_workers,
         validation_fraction=args.validation_fraction,
         validation_interval=args.validation_interval,

@@ -22,6 +22,25 @@ uv run pytest -q
 
 项目使用 Python 3.11，依赖由 `pyproject.toml` 和 `uv.lock` 固定。
 
+## 在服务器下载 Hugging Face 文件
+
+如果 SSH 会话导出了指向本机的 `HTTP_PROXY/HTTPS_PROXY`，使用下面的脚本下载。
+它会仅对下载进程移除 SSH 代理，并由服务器直连 HF 镜像：
+
+```bash
+scripts/hf_download_server.sh google/paligemma2-3b-pt-224
+```
+
+PaliGemma 是受限模型，首次下载前仍需在 Hugging Face 页面接受许可并执行
+`hf auth login`。同一脚本也能下载数据集，例如：
+
+```bash
+scripts/hf_download_server.sh OWNER/DATASET --repo-type dataset
+```
+
+脚本默认使用 `https://hf-mirror.com`，缓存到 `~/.cache/huggingface`，并且
+不会修改当前 shell 的代理变量。
+
 ## 检查真实 SO101 数据
 
 ```bash
