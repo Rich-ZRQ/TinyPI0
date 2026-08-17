@@ -1,15 +1,6 @@
-"""Minimal pi0 profile for unit tests and fast architecture debugging.
+"""Small-capacity Tiny pi0 profile for tests and architecture debugging."""
 
-Use ``SO101_RECOMMENDED`` for real two-camera SO-ARM101 experiments. Keeping
-this profile small makes the complete test suite practical on a laptop.
-"""
-
-from configs.schema import (
-    Pi0Config,
-    RuntimeConfig,
-    TransformerConfig,
-    VisionConfig,
-)
+from configs.schema import Pi0Config, TransformerConfig, VisionConfig
 
 TINY_PI0 = Pi0Config(
     vision=VisionConfig(
@@ -42,12 +33,4 @@ TINY_PI0 = Pi0Config(
     action_horizon=50,
     max_token_len=48,
     dtype="float32",
-)
-
-
-LOCAL_RUNTIME = RuntimeConfig(
-    batch_size=1,
-    gradient_checkpointing=False,
-    compile_model=False,
-    num_workers=0,
 )

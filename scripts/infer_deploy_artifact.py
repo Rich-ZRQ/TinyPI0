@@ -20,7 +20,7 @@ from pi0.types import IMAGE_KEYS
 
 @dataclass(frozen=True)
 class Args:
-    artifact_dir: Path = Path("artifacts/pi0_so101_recommended_step10000")
+    artifact_dir: Path = Path("artifacts/pi0_so101_recommended_step7000")
     dataset_root: Path = Path.home() / ".cache/huggingface/lerobot/Rich-RZ/so101_chocolates_to_bowl_v1"
     paligemma_snapshot: Path | None = None
     sample_index: int = 0

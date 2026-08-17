@@ -1,1115 +1,492 @@
-# Tiny π0：基于配置缩放的 PyTorch 端到端复刻指南
+# Tiny π0：PyTorch 端到端实现与实训指南
 
-> 适用代码版本：`openpi` commit `15a9616`  
-> 主线模型：**π0（flow matching）**，不是 π0-FAST，也不是 π0.5  
-> 本机硬件：RTX 3050 Ti Laptop，4 GB VRAM  
-> 最终目标：在 `Tiny_pi0` 中用一套代码实现 Tiny/Full 两种规模的模型、数据、训练、参数加载、推理与部署  
-> 对照实验：`openpi` 的 `pi0_aloha_sim`（作为可执行标准答案和数值基线）
-> 自研框架：**PyTorch**；主要参考官方 `models_pytorch`，JAX 仅用于一次性的原始权重转换
+本文只讲当前 `Tiny_pi0` 仓库中已经实现、测试和实际运行过的代码。目标是沿着一条连续链路理解：原始机器人数据如何进入模型，模型如何学习 50 步动作块，checkpoint 如何恢复，以及动作如何送到 SO101。
 
-## 0. 先说清楚“复现”的边界
+## 1. 项目边界
 
-这份文档的目标不是教你把 openpi 当黑盒调用，而是让你以官方 PyTorch 版为标准答案，在 `Tiny_pi0` 中自己实现一套端到端 π0。由于本机只有 4 GB 显存，本地使用 `tiny` 配置开发；迁移到服务器后切换为 `full` 配置。两者必须实例化同一组类、执行同一条 forward/loss/sampler 路径，只允许配置中的宽度、深度、头数和训练资源参数不同。
+当前实现保留了 π0 最有教学价值的结构：
 
-这里的“无差别复刻”专指**架构算法和代码路径无差别**：Tiny 仍包含 SigLIP/PaliGemma 视觉语言前缀、Action Expert、block attention、flow matching、Euler sampler 和 KV cache。Tiny 的参数 shape 与 Full 不同，因此数值结果不同，也不能加载官方 Full 权重；只有切换到 Full 配置后，才能加载 `pi0_base` 并与官方模型逐值对齐。不要把“同构”误写成“Tiny 与官方模型数值相同”。
+- 图像与语言组成 prefix；
+- state、带噪动作与时间组成 suffix；
+- prefix expert 和 action expert 使用独立参数；
+- 两个 expert 的 Q/K/V 在注意力维度联合计算；
+- 训练目标是条件 Flow Matching；
+- 推理从高斯噪声通过 Euler 积分得到动作块；
+- 推理时缓存每层 prefix 的 K/V。
 
-但不能从零完美复现 Physical Intelligence 官方的 `pi0_base` 预训练。仓库只说明基础模型使用了 10k+ 小时机器人数据，完整数据混合、采集数据、过滤规则、采样权重、训练算力和全部超参数并未公开。因此最严谨、也最有学习价值的目标是：
+需要明确三点：
 
-1. 用 Tiny 配置在 4 GB 本机实现并验证完整架构；
-2. 用 Tiny 配置跑通数据、loss、反向传播、checkpoint、采样和 mock 部署；
-3. 在服务器仅切换为 Full 配置，确认无需修改模型代码；
-4. 转换并加载 `pi0_base`，用相同输入逐模块对齐官方 `PI0Pytorch`；
-5. 使用自己的真机采集数据在服务器微调；
-6. 服务器运行 Full policy，机器人端运行客户端和安全执行层。
+1. 这是 PyTorch 教学实现，不是 `openpi` 仓库的镜像。
+2. 当前 decoder 形状比官方 π0 小，并从头训练，不能加载官方 π0 decoder 权重。
+3. PaliGemma 2 只提供冻结的视觉编码器、multimodal projector 和文本 embedding；Gemma 语言 decoder 没有被加载。
 
-## 1. 你最终要掌握的全链路
+因此，“复刻”指架构思想、数据流、训练和推理机制对齐，而不是官方 checkpoint 的逐参数等形复现。
 
-```text
-LeRobot 原始样本
-  -> 时间窗口采样（长度 action_horizon）
-  -> repack_transforms：数据集字段重排
-  -> data_transforms：机器人坐标/相机/动作空间适配
-  -> Normalize：state 与 actions 归一化
-  -> model_transforms：图像缩放、文本分词、维度补零
-  -> Observation + Actions batch
-  -> Pi0.compute_loss：条件流匹配训练
-  -> AdamW 更新（可选 EMA）
-  -> safetensors + optimizer checkpoint
-  -> Policy：输入变换
-  -> Pi0.sample_actions：从高斯噪声积分到动作块
-  -> 反归一化 + 机器人输出变换
-  -> action chunk
+## 2. 当前端到端数据流
+
+```mermaid
+flowchart LR
+    A[LeRobot 双摄视频] --> P[Pi0Processor]
+    B[任务文本] --> P
+    C[6维关节状态] --> D[补零到32维并归一化]
+    P --> E[冻结 SigLIP / token embedding]
+    E --> F[共享投影到 prefix width]
+    F --> G[Prefix tokens]
+    D --> H[State token]
+    I[50x32 动作 + 噪声 + t] --> J[Action tokens]
+    G --> K[8层双专家 Joint Transformer]
+    H --> K
+    J --> K
+    K --> L[预测速度 50x32]
+    L --> M[Flow Matching loss 或 Euler 去噪]
+    M --> N[反归一化后的前6维 SO101 动作]
 ```
 
-采用“双轨、双配置开发”：`openpi/` 只用于参考，`Tiny_pi0/` 放独立实现；`tiny` 用于本机功能测试，`full` 用于服务器官方参数对齐、微调和推理。Tiny 阶段做不依赖官方参数的算法测试；Full 阶段才做逐张量数值等价测试。
+模型外部的统一 tensor 契约是：
 
-## 2. π0、π0-FAST、π0.5 的边界
-
-| 模型 | openpi 类型 | 动作生成方式 | 本文是否展开 |
-|---|---|---|---|
-| π0 | `ModelType.PI0` | flow matching，连续动作块 | 是，唯一主线 |
-| π0-FAST | `ModelType.PI0_FAST` | FAST 动作 tokenizer + 自回归 | 否 |
-| π0.5 | `ModelType.PI05` | 仓库中仍使用 flow head，但状态编码和归一化结构不同 | 仅作对照 |
-
-最可靠的辨别方法不是配置名称，而是看模型配置：
-
-```python
-pi0_config.Pi0Config(pi05=False)  # π0
-pi0_config.Pi0Config(pi05=True)  # π0.5
-```
-
-本文避免使用 `pi05_*` 和 `pi0_fast_*` 配置。
+| 内容 | 形状 | 说明 |
+|---|---|---|
+| 单路图像 | `[B, 3, 224, 224]` | SigLIP 输入 |
+| `image_mask` | `[B]` | batch 中每个样本是否有该相机 |
+| 文本 token | `[B, 48]` | BOS + prompt + newline + padding |
+| state | `[B, 32]` | SO101 前 6 维有效，其余补零 |
+| actions | `[B, 50, 32]` | 未来动作块 |
+| timestep | `[B]` | 每个样本一个 flow 时间 |
+| velocity | `[B, 50, 32]` | 模型预测结果 |
 
 ## 3. 环境准备
 
-本节不是要求一次性执行所有命令。按当前 Tiny→Full 路线分为四组：
+### 3.1 本机条件
 
-| 阶段 | 现在是否执行 | 内容 |
-|---|---|---|
-| A. 本机基础检查 | 现在 | WSL2、GPU、Git、uv、Python 3.11 |
-| B. Tiny 自研环境 | 项目骨架建立时 | 独立 `.venv`、PyTorch、测试与基础依赖 |
-| C. 官方 openpi 对照环境 | 需要运行官方代码时 | 子模块、openpi `uv sync`、transformers patch |
-| D. Full 权重与训练环境 | 服务器阶段 | `pi0_base` 转换、Full 对齐、微调和正式推理 |
+- Ubuntu 22.04 或 WSL2 Ubuntu；
+- Python 3.11；
+- 本地 RTX 3050 Ti 4 GB 用于测试与 BF16 推理；
+- RTX 4090 用于 `SO101_TINY` 训练；
+- WSL 内 `nvidia-smi` 必须可见 GPU。
 
-### 3.1 硬件和系统
-
-你的 3050 Ti 只有 4 GB 显存，不能承担完整 π0 的官方权重加载、正式推理或微调。本机职责是 Tiny 模型开发、数据管线、小规模训练和 mock 部署；Full 权重转换、数值对齐、微调和推理放到远程大显存服务器。仓库主要在 Ubuntu 22.04 上测试；Windows 本机使用 WSL2 Ubuntu，并确认 WSL 能识别 GPU。
-
-```bash
-nvidia-smi
-git --version
-```
-
-当前机器已经通过 GPU 检查：WSL2 能识别 RTX 3050 Ti Laptop GPU，显存 4096 MiB。以后如果 Windows 驱动发生变化，再重复执行即可。
-
-### 3.2 安装 uv 和依赖
-
-本机当前没有 `uv`，现在需要安装：
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source ~/.bashrc
-uv --version
-```
-
-然后让 uv 安装项目统一使用的 Python 3.11。不要使用当前 Conda base 的 Python 3.13 作为本项目解释器：
-
-```bash
-uv python install 3.11
-uv python find 3.11
-```
-
-到这里是**现在必须完成**的环境准备。先不要下载官方 Full 权重。
-
-### 3.3 Tiny 自研环境（建立项目骨架时执行）
-
-`Tiny_pi0` 应有自己的 `pyproject.toml` 和 `.venv`，与 openpi 官方环境隔离。项目骨架尚未建立时无需提前手工安装一堆包；建立后执行：
+初始化项目：
 
 ```bash
 cd ~/pi0/Tiny_pi0
-uv venv --python 3.11
 uv sync
-uv run python - <<'PY'
-import torch
-print("PyTorch:", torch.__version__)
-print("CUDA available:", torch.cuda.is_available())
-print("GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
-PY
+uv run pytest -q
 ```
 
-Tiny 项目的首批依赖应由自己的 `pyproject.toml` 固定，至少包括 PyTorch、NumPy、einops、safetensors、Pillow、pytest 和配置/CLI 库。不要让 Tiny 项目隐式依赖 openpi 的 `.venv`。
+`pyproject.toml` 声明 Python 版本、运行依赖和开发依赖；`uv.lock` 固定解析后的具体依赖版本。`uv sync` 根据这两个文件创建或更新 `.venv`，`uv run ...` 则在这个环境中运行命令。
 
-### 3.4 官方 openpi 对照环境（稍后按需执行）
+### 3.2 PaliGemma 访问
 
-只有当你需要运行官方 `PI0Pytorch`、官方数据加载器或转换脚本时，才执行：
+先在 Hugging Face 页面接受 `google/paligemma2-3b-pt-224` 的许可：
 
 ```bash
-cd ~/pi0/openpi
-git submodule update --init --recursive
-GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+uv run hf auth login
+scripts/hf_download_server.sh google/paligemma2-3b-pt-224
 ```
 
-快速自检：
+登录成功但得到 403，通常表示账号尚未在模型页面接受 gated license，而不是 token 无效。
 
-```bash
-uv run python - <<'PY'
-import torch
-from openpi.training import config
-
-print("PyTorch:", torch.__version__)
-print("CUDA available:", torch.cuda.is_available())
-print("GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
-cfg = config.get_config("pi0_aloha_sim")
-print(cfg)
-print("model type:", cfg.model.model_type)
-PY
-```
-
-预期模型类型为 `ModelType.PI0`，并且 `CUDA available` 为 `True`。这套官方环境依赖较多、下载量较大，不是开始写 Tiny 配置和纯模块代码的前置条件。
-
-### 3.5 官方 PyTorch transformers patch（最后执行）
-
-openpi 已提供 `PI0Pytorch`、PyTorch 训练入口和 JAX→PyTorch 参数转换器，因此直接把官方 PyTorch 实现作为逐段重写的标准答案。官方实现要求 `transformers==4.53.2`，并把定制文件复制进 transformers：
-
-```bash
-cd ~/pi0/openpi
-uv pip install transformers==4.53.2
-cp -r ./src/openpi/models_pytorch/transformers_replace/* \
-  .venv/lib/python3.11/site-packages/transformers/
-```
-
-这个 patch 会改动当前虚拟环境中的 transformers；uv 默认 hardlink 还可能让改动进入 uv cache。你的 `Tiny_pi0` 最好使用独立虚拟环境；自研实现也应尽量把必要改动放进自己的模块，不要永久修改第三方包源码。官方环境若需彻底撤销，应按仓库提示执行 `uv cache clean transformers` 后重建环境。
-
-不要现在执行这个 patch。等第一次需要实例化官方 `openpi.models_pytorch.PI0Pytorch` 做 Full 对照时再执行；Tiny 自研环境不应用这个 patch。
-
-## 4. 本机第一个里程碑：Tiny 配置跑通训练骨架
-
-官方 `debug` 并不等于你的最终 Tiny profile，而且仍可能实例化较重的视觉组件。本机首要目标是让你自己的同构 `Pi0Model(TINY_PI0)` 使用假数据、batch size 1 和少量 step，验证 PyTorch forward/backward、优化器和 checkpoint 全链路。
-
-```bash
-cd ~/pi0/Tiny_pi0
-python -m scripts.train \
-  --profile tiny \
-  --data-profile fake \
-  --max-steps 10 \
-  --batch-size 1
-```
-
-这是本指南规定的目标 CLI；需要在实现训练器时让它成立。
-
-成功后应看到：
+`pi0/paligemma_prefix.py` 从 `model-00001-of-00002.safetensors` 中选择性读取三个前缀：
 
 ```text
-checkpoints/tiny/debug/<step>/
+vision_tower.*
+multi_modal_projector.*
+language_model.model.embed_tokens.*
 ```
 
-这一步失败时先不要下载大权重。先打印每个阶段的 shape 和 `torch.cuda.max_memory_allocated()`；必要时关闭 compile、保持 batch 1、减少 dataloader worker。若仍超出 4 GB，使用 `smoke` profile 定位，再回到保持正式接口的 `tiny` profile。
+它没有构造完整 3B 模型，因此能在 4 GB 显存中运行。当前实测冻结参数约 10.08 亿，显存分配约 1.9 GB。
 
-## 5. 模型搭建：从配置走到 Pi0
+## 4. 配置：只保留 Tiny 架构
 
-### 5.1 代码入口
+项目保留两档容量，但只有一套实现：
 
-按下面顺序阅读官方 PyTorch 实现：
+### `TINY_PI0`
 
-1. `src/openpi/models/pi0_config.py`：框架共享的模型尺寸与输入输出规格；
-2. `src/openpi/models_pytorch/pi0_pytorch.py`：π0 主体、embedding、loss、采样；
-3. `src/openpi/models_pytorch/gemma_pytorch.py`：PaliGemma 与 Action Expert 的联合实现；
-4. `src/openpi/models_pytorch/preprocessing_pytorch.py`：PyTorch 图像预处理；
-5. `scripts/train_pytorch.py`：训练、DDP、优化器与 checkpoint；
-6. `examples/convert_jax_model_to_pytorch.py`：官方参数转换规则。
-
-`src/openpi/models/pi0.py` 和 `gemma.py` 只在遇到 PyTorch 代码注释不充分或需要确认原始数学语义时查阅，不作为你的主要照抄对象。
-
-默认 `Pi0Config`：
-
-```python
-Pi0Config(
-    dtype="bfloat16",
-    paligemma_variant="gemma_2b",
-    action_expert_variant="gemma_300m",
-    action_dim=32,
-    action_horizon=50,
-    max_token_len=48,
-    pi05=False,
-)
-```
-
-输入张量约定（`B` 为 batch）：
-
-| 输入 | 形状 | 含义 |
-|---|---:|---|
-| 三路图像 | `[B, 224, 224, 3]` | base、left wrist、right wrist |
-| image mask | `[B]`/每路 | 对应视角是否有效 |
-| state | `[B, 32]` | 原维度不足时补零 |
-| tokenized prompt | `[B, 48]` | PaliGemma tokenizer 输出 |
-| actions | `[B, 50, 32]` | 一次预测的动作块 |
-
-实际 ALOHA 状态/动作是 14 维；`PadStatesAndActions(32)` 把它们补到 32 维，策略输出阶段再裁回 14 维。**不要把 padding 维度当成真实机器人自由度。**
-
-### 5.2 Tiny/Full 配置设计
-
-不要创建 `TinyPi0Model` 和 `FullPi0Model` 两套类。只创建一个 `Pi0Model(config)`，所有尺寸都来自不可变配置。建议分成结构配置和运行配置：
-
-```python
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class TransformerConfig:
-    width: int
-    depth: int
-    mlp_dim: int
-    num_heads: int
-    num_kv_heads: int
-    head_dim: int
-
-
-@dataclass(frozen=True)
-class VisionConfig:
-    image_size: int
-    patch_size: int
-    width: int
-    depth: int
-    mlp_dim: int
-    num_heads: int
-
-
-@dataclass(frozen=True)
-class Pi0Config:
-    vision: VisionConfig
-    paligemma: TransformerConfig
-    action_expert: TransformerConfig
-    vocab_size: int = 257_152
-    action_dim: int = 32
-    action_horizon: int = 50
-    max_token_len: int = 48
-    dtype: str = "float32"
-
-
-@dataclass(frozen=True)
-class RuntimeConfig:
-    batch_size: int
-    gradient_checkpointing: bool
-    compile_model: bool
-    num_workers: int
-```
-
-本机 Tiny profile 建议先保持正式数据契约不变，只缩小神经网络容量：
-
-```python
-TINY_PI0 = Pi0Config(
-    vision=VisionConfig(
-        image_size=224,
-        patch_size=14,
-        width=128,
-        depth=2,
-        mlp_dim=256,
-        num_heads=4,
-    ),
-    paligemma=TransformerConfig(
-        width=128,
-        depth=2,
-        mlp_dim=256,
-        num_heads=4,
-        num_kv_heads=1,
-        head_dim=32,
-    ),
-    action_expert=TransformerConfig(
-        width=64,
-        depth=2,
-        mlp_dim=128,
-        num_heads=4,
-        num_kv_heads=1,
-        head_dim=32,
-    ),
-    action_dim=32,
-    action_horizon=50,
-    max_token_len=48,
-    dtype="float32",
-)
-
-LOCAL_RUNTIME = RuntimeConfig(
-    batch_size=1,
-    gradient_checkpointing=False,
-    compile_model=False,
-    num_workers=0,
-)
-```
-
-Full profile 必须填写官方尺寸：SigLIP So400m/14、Gemma 2B、Gemma 300M、`action_dim=32`、`action_horizon=50` 和 `max_token_len=48`。其精确字段以当前 commit 的官方 PyTorch/config 源码为准，并给配置保存版本号与 hash，避免手抄后悄悄漂移。
-
-必须在构造时断言双 expert 的兼容约束：层数、attention head 数、KV head 数和 head dimension 满足官方联合 attention 的要求。不要在 forward 中用 `if config.profile == "tiny"` 切换算法；Tiny/Full 的区别只能体现在层循环次数和张量尺寸。
-
-建议保持 224 图像、32 维 padded action 和 50 步 horizon，以便本地就测试正式接口。如果 4 GB 下视觉反向仍超限，可增加 `smoke` profile 把图像或 horizon 临时缩小，但它只用于冒烟测试，不能替代 `tiny` 的正式接口测试。
-
-### 5.3 三个核心组件
-
-`Pi0.__init__` 搭建：
-
-- PaliGemma 主干：SigLIP `So400m/14` 图像编码器 + Gemma 2B 语言专家；
-- action expert：Gemma 300M 配置，与主干在每层注意力中联合计算；
-- 连续动作头：`state_proj`、`action_in_proj`、时间/动作 MLP、`action_out_proj`。
-
-关键点：它不是“先让 VLM 输出文字，再把文字转动作”。图像/语言构成 prefix，状态、带噪动作和 flow 时间构成 suffix；两个专家在同一个注意力结构中交换上下文，动作专家直接回归速度场。
-
-### 5.4 prefix 与 suffix
-
-`embed_prefix()`：
-
-1. 每路图像经 SigLIP 变成视觉 token；
-2. prompt token 经 Gemma embedding；
-3. 图像和语言 token 组成 prefix；
-4. prefix 内使用全注意力，并用 image/token mask 屏蔽 padding。
-
-`embed_suffix()`（π0 分支）：
-
-1. `state_proj(state)` 产生一个 state token；
-2. `action_in_proj(noisy_actions)` 投影整段带噪动作；
-3. 标量时间 `t` 经正弦/余弦位置编码；
-4. 每个动作 token 与时间 embedding 拼接后经过 MLP；
-5. suffix 中 state/action 块按 `ar_mask` 形成块级注意力关系。
-
-`make_attn_mask()` 用 `ar_mask` 的累积和构造 prefix-LM/块因果 mask。阅读模型时务必手算一个小 mask；这是理解 π0 信息流最有效的一步。
-
-## 6. 训练目标：条件流匹配
-
-给定真实动作块 `a`：
+位于 `configs/tiny.py`，用于单元测试和快速阅读代码：
 
 ```text
-ε ~ N(0, I)
-t ~ Beta(1.5, 1)，并限制在 [0.001, 1]
+prefix expert: width=128, depth=2, mlp=256
+action expert: width=64, depth=2, mlp=128
+heads=4, kv_heads=1, head_dim=32
+```
+
+### `SO101_TINY`
+
+位于 `configs/so101.py`，与当前 step7000 artifact 的架构一致：
+
+```text
+prefix expert: width=1024, depth=8, mlp=8192
+action expert: width=512, depth=8, mlp=2048
+heads=8, kv_heads=1, head_dim=128
+action_dim=32, horizon=50, max_token_len=48
+```
+
+可训练部分约 2.58 亿参数。`TINY_PI0` 不是另一种算法，只是让完整测试无需构造 2.58 亿参数。
+
+运行以下命令可核对配置：
+
+```bash
+uv run python -m scripts.inspect_config
+```
+
+## 5. Prefix：图像和语言如何进入模型
+
+### 5.1 图像不是只做一次 patch embedding
+
+`PaliGemmaPrefixEncoder.encode_images()` 会完整运行冻结的 SigLIP vision tower：
+
+```text
+[B, 3, 224, 224]
+  -> 16 × 16 个 patch
+  -> 256 个视觉 token
+  -> SigLIP 27 层编码
+  -> multimodal projector
+  -> [B, 256, 2304]
+```
+
+一个 patch 对应一个 token，所以 `num_tokens=(224/14)^2=256`。`256` 是序列长度，`2304` 是每个 token 的特征宽度。
+
+### 5.2 文本不是运行语言模型
+
+`Pi0Processor` 把 prompt 变成 48 个 token id；`embed_text()` 只查 Gemma embedding table，并按 Gemma 输入约定乘 `sqrt(2304)`：
+
+```text
+[B, 48] token ids -> [B, 48, 2304]
+```
+
+图像特征不会再乘这个缩放，因此文本不存在“乘两次”的问题。图像和文本随后共享一个可训练线性层，从 2304 投影到 `SO101_TINY` 的 1024。
+
+### 5.3 为什么接口有三路图像而数据只有两路
+
+`IMAGE_KEYS` 保留三个通用位置：base、left wrist、right wrist。SO101 adapter 只填前两路，第三路的 `image_mask=False`。当整个 batch 都缺少某路相机时，`Pi0PrefixEmbedding` 会跳过 SigLIP 计算，也不会把这路 token 放进 transformer。
+
+`image_mask` 的形状是 `[B]`，因为它描述每个样本是否存在整张相机图像；进入 prefix 后才扩展为 `[B, 256]`，表示该图像产生的全部视觉 token 是否有效。
+
+## 6. Suffix：state、动作与时间
+
+`Pi0ActionEmbedding` 构造 `1 + 50` 个 suffix token：
+
+1. `state_proj([B,32]) -> [B,1,512]`；
+2. `action_in_proj([B,50,32]) -> [B,50,512]`；
+3. 一个样本共享同一个 `t`，生成 sinusoidal time embedding；
+4. 每个动作 token 与 time embedding 拼接，经两层 MLP；
+5. state token 与 50 个 action token 合并为 `[B,51,512]`。
+
+同一条 action chunk 的 50 个动作使用同一个 `t`，不是 50 个互不相同的时间。训练时每个 batch 样本随机采一个 `t`，所以 batch 内不同样本的时间通常不同。推理的一轮 Euler step 中，整个 chunk 也共享当前时间。
+
+最后 `project_velocity()` 把 50 个 action hidden states 从 512 投影到 32 维速度。`suffix_output[:, -50:, :]` 是沿序列维 `dim=1` 取最后 50 个 token，不是沿 hidden 维切片。
+
+## 7. 双专家 Joint Transformer
+
+每层由两个参数独立的 Gemma decoder layer 组成：
+
+- prefix expert 处理视觉/语言 token，width 1024；
+- action expert 处理 state/action/time token，width 512；
+- 两边拥有独立 RMSNorm、Q/K/V/O projection 和 gated MLP；
+- 两边的 head 数与 head_dim 相同，所以 Q/K/V 可以沿序列维拼接并进行联合注意力。
+
+注意力内部形状可概括为：
+
+```text
+Q: [B, num_heads, sequence_length, head_dim]
+K/V: [B, num_kv_heads, sequence_length, head_dim]
+```
+
+`width` 不等于序列长度。`width = num_heads × head_dim` 表示把每个 token 的一行特征拆成多个头；每个 head 仍处理所有 token，而不是只处理一行。
+
+当前 `num_kv_heads=1`，属于 GQA/MQA。K/V 在计算中扩展给 8 个 query head 使用，但底层仍只有一组 K/V 参数。反向传播时，各 query head 对共享 K/V 的梯度会自动相加到同一个参数，不会产生八份互相冲突的 K/V 权重。
+
+Q 乘 `head_dim**-0.5` 是为了让 QK 点积的方差不随维度增大，避免 softmax 过早饱和。
+
+### Block attention
+
+`make_att_2d_masks()` 先用 `att_masks` 的累计和划分 block，再允许 query 查看自身 block 和以前的 block：
+
+- 图像和文本 prefix 属于同一个双向 block；
+- state 开启新的 block；
+- action token 再开启一个 block，并在 action block 内双向可见；
+- padding token 永远不可见。
+
+这样 action 能读取视觉、语言和 state，prefix 不依赖正在去噪的 action。
+
+## 8. Flow Matching 训练目标
+
+真实归一化动作记为 `a`，高斯噪声记为 `ε`。每个样本从 Beta(1.5, 1) 采样一个 `t`，并限制到 `[0.001, 0.999]`：
+
+```text
 x_t = t ε + (1 - t) a
 u_t = ε - a
+loss = MSE(v_theta(prefix, state, x_t, t), u_t)
 ```
 
-网络接收观测、`x_t` 和 `t`，输出速度场 `v_θ(x_t, obs, t)`。代码中的逐时间步损失为：
+当 `t≈0` 时输入接近真实动作；当 `t≈1` 时输入接近纯噪声。模型学习在条件 prefix 下预测整条路径的速度。
+
+loss 的屏蔽分两层：
+
+- `action_dim_mask`：SO101 只有前 6 维真实动作，第 7–32 维不参与 loss；
+- `action_valid_mask`：episode 尾部凑不满 50 步时，重复最后动作用于保持 shape，但补齐步不参与 loss。
+
+## 9. 推理与 Prefix KV cache
+
+推理从 `[B,50,32]` 高斯噪声开始，在 `t=1` 到 `t=0` 做 Euler 积分：
 
 ```text
-L = mean_action_dim[(v_θ - u_t)²]
+dt = -1 / num_steps
+x <- x + dt * v_theta(x, t)
 ```
 
-注意仓库的时间约定：`t=1` 是噪声，`t=0` 是动作，和 π0 论文中的记法相反。物理过程没有变，只是变量方向相反。
+默认 `num_steps=10`，因此 decoder 会执行 10 次。
 
-对应源码是 `Pi0.compute_loss()`。阅读时逐行标出：随机增强 RNG、噪声 RNG、时间 RNG、插值、联合 forward、输出投影、MSE。
+视觉、语言和 prompt 在这 10 次中不变。`prefill_prefix()` 先把 prefix 逐层向前计算，并保存每层经过 RoPE 的 K 与 V。随后 `decode_suffix()` 每一步只重新计算会变化的 action expert Q/K/V，再把 suffix K/V 与对应层的 prefix K/V 拼接。
 
-## 7. 数据处理：从 LeRobot 到模型 batch
+为什么不缓存 prefix Q：Q 只用于“当前 token 去读取 K/V”。suffix 查询 prefix 时需要的是 prefix K/V；prefix Q 的注意力输出已在 prefill 中进入下一层 hidden state，之后不会再被 suffix 使用。缓存 Q 只会占显存，不会减少后续必要计算。
 
-### 7.1 ALOHA Sim 主线配置
+两层 decoder 时也不是只有一份 cache，而是每层一份 `(prefix_key, prefix_value)`，因为第 2 层的 prefix hidden state 已经过第 1 层更新。
 
-仓库的端到端公开示例：
+## 10. LeRobot 数据适配
 
-```python
-TrainConfig(
-    name="pi0_aloha_sim",
-    model=Pi0Config(),
-    data=LeRobotAlohaDataConfig(
-        repo_id="lerobot/aloha_sim_transfer_cube_human",
-        default_prompt="Transfer cube",
-        use_delta_joint_actions=False,
-    ),
-    weight_loader=CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-    num_train_steps=20_000,
-)
-```
-
-这里选择绝对动作（`use_delta_joint_actions=False`），并从官方 `pi0_base` 初始化。
-
-### 7.2 动作 chunk 如何生成
-
-`create_torch_dataset()` 读取 LeRobot metadata 中的 FPS，并为每个样本请求：
-
-```python
-delta_timestamps = {key: [t / fps for t in range(action_horizon)]}
-```
-
-因此单个时刻会配上未来 `action_horizon=50` 帧动作，而不是只学习下一步动作。这就是 action chunking 的数据来源。
-
-### 7.3 完整变换顺序
-
-训练输入严格按以下顺序执行：
+`LeRobotPi0Dataset` 读取：
 
 ```text
-repack_transforms.inputs
--> data_transforms.inputs
--> Normalize
--> model_transforms.inputs
+meta/info.json
+meta/stats.json
+meta/tasks.parquet
+meta/episodes/chunk-*/*.parquet
+data/chunk-*/*.parquet
+videos/.../*.mp4
 ```
 
-对 `pi0_aloha_sim` 展开：
-
-1. `RepackTransform`：把 LeRobot 的 `observation.images.top`、`observation.state`、`action` 重排为统一键；
-2. `AlohaInputs`：相机名映射到 `base_0_rgb/left_wrist_0_rgb/right_wrist_0_rgb`，转换 HWC 图像、状态和动作约定；
-3. `Normalize`：π0 使用 mean/std z-score；
-4. `InjectDefaultPrompt("Transfer cube")`；
-5. `ResizeImages(224, 224)`；
-6. `TokenizePrompt(PaligemmaTokenizer(max_len=48))`；
-7. `PadStatesAndActions(32)`。
-
-由于 π0 的 `use_quantile_norm=False`，其公式是：
+SO101 映射是：
 
 ```text
-x_norm = (x - mean) / (std + 1e-6)
+observation.images.front -> base_0_rgb
+observation.images.wrist -> left_wrist_0_rgb
 ```
 
-不要把 π0.5 默认使用的 q01/q99 quantile normalization 套到 π0 主线上。
+数据集的标称 FPS 决定相邻动作的时间间隔。当前元数据是 20 FPS，因此 horizon 50 表示大约 2.5 秒动作。相机硬件可用 30/60 FPS 采集，但这与动作控制频率不是同一件事；训练依据的是数据集帧和时间戳。
 
-### 7.4 检查真实 batch
-
-先算归一化统计（下一节），然后用下面脚本检查模型真正收到的形状：
+检查真实样本：
 
 ```bash
-uv run python - <<'PY'
-import torch
-from openpi.training import config, data_loader
-
-cfg = config.get_config("pi0_aloha_sim")
-loader = data_loader.create_data_loader(
-    cfg, shuffle=False, num_batches=1, framework="pytorch"
-)
-obs, actions = next(iter(loader))
-
-print("images:", {k: (v.shape, v.dtype) for k, v in obs.images.items()})
-print("masks:", {k: v.shape for k, v in obs.image_masks.items()})
-print("state:", obs.state.shape, obs.state.dtype)
-print("tokens:", obs.tokenized_prompt.shape)
-print("actions:", actions.shape, actions.dtype)
-print("device before trainer transfer:", actions.device)
-print("CUDA available:", torch.cuda.is_available())
-PY
+uv run python -m scripts.inspect_so101_dataset
 ```
 
-期望最后两维分别接近 `state[..., 32]` 和 `actions[..., 50, 32]`。
+重点确认 episode 数、帧数、FPS、任务文本、6 维 state/action、两张图像和有效 action 步数。
 
-## 8. 计算 normalization stats
+## 11. 归一化
 
-训练前执行：
-
-```bash
-cd ~/pi0/openpi
-uv run scripts/compute_norm_stats.py --config-name pi0_aloha_sim
-```
-
-统计结果写入：
+默认读取 LeRobot `meta/stats.json` 中每个真实机器人维度的 `q01/q99`，映射到 `[-1,1]`：
 
 ```text
-assets/pi0_aloha_sim/<asset_id>/norm_stats.json
+normalized = 2 * (x - q01) / (q99 - q01 + eps) - 1
 ```
 
-统计脚本使用相同的数据集、repack 和 robot-specific transforms，但在真正 Normalize 前收集 state/actions 分布。训练 checkpoint 会复制对应 assets；推理必须使用与训练一致的统计量。
+推理输出再做逆变换。统计量只有 6 维，而模型 tensor 有 32 维，因此 normalizer 只变换前 6 维；补零维原样保留，并由 dimension mask 排除。这不是把数据“扩充到 `[B,50,D]`”，广播只是让同一组逐维统计量作用到任意 batch 和时间位置。
 
-三条硬规则：
+## 12. 训练流程
 
-- 改了动作表达（绝对/增量、关节/末端速度）后必须重算；
-- 改了状态/动作维度或单位后必须重算；
-- 推理不能拿另一个机器人或另一份数据的 stats 混用。
-
-## 9. 正式微调 π0
-
-### 9.1 官方 JAX 原始基线（选读，不是自研主线）
-
-以下命令用于确认原始发布实现；采用 PyTorch 自研时可以在 PyTorch baseline 跑通后再选读。
+### 12.1 先做 100 步验收
 
 ```bash
-cd ~/pi0/openpi
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-uv run scripts/train.py pi0_aloha_sim \
-  --exp-name=pi0_foundation_run \
-  --overwrite
+uv run python -m scripts.train_so101 \
+  --profile so101 \
+  --max-steps 100 \
+  --micro-batch-size 4 \
+  --gradient-accumulation-steps 8 \
+  --validation-interval 20 \
+  --validation-batches 8 \
+  --checkpoint-interval 50 \
+  --output-dir checkpoints/so101_tiny_smoke
 ```
 
-首次执行会下载数据和 `gs://openpi-assets/checkpoints/pi0_base/params`。下载缓存默认在 `~/.cache/openpi`；可通过 `OPENPI_DATA_HOME` 修改。
-
-如果不想启用 W&B：
+### 12.2 正式训练
 
 ```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-uv run scripts/train.py pi0_aloha_sim \
-  --exp-name=pi0_foundation_run \
-  --overwrite \
-  --wandb-enabled=false
+uv run python -m scripts.train_so101 \
+  --profile so101 \
+  --max-steps 30000 \
+  --micro-batch-size 4 \
+  --gradient-accumulation-steps 8 \
+  --learning-rate 1e-4 \
+  --end-learning-rate 1e-5 \
+  --warmup-steps 1000 \
+  --validation-interval 500 \
+  --validation-batches 32 \
+  --validation-action-batches 1 \
+  --validation-sampling-steps 10 \
+  --checkpoint-interval 1000 \
+  --output-dir checkpoints/so101_tiny
 ```
 
-断点恢复时不要同时传 `--overwrite`：
+训练器执行以下步骤：
+
+1. 按 episode 而非 frame 切分 train/validation，防止同一 episode 泄漏；
+2. 冻结 PaliGemma 前端，只优化 input projection 和双专家 core；
+3. 可训练参数与 AdamW moments 保持 FP32；
+4. CUDA 矩阵计算使用 BF16 autocast；
+5. 梯度累积后裁剪 norm，再执行 optimizer step；
+6. warmup 后做 cosine decay；
+7. 验证 flow loss、整个有效动作块 MAE 和首动作 MAE；
+8. 原子保存 checkpoint，避免中途写坏目录。
+
+有效 batch size 为：
+
+```text
+micro_batch_size × gradient_accumulation_steps
+```
+
+这里为 `4 × 8 = 32`。
+
+恢复训练：
 
 ```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-uv run scripts/train.py pi0_aloha_sim \
-  --exp-name=pi0_foundation_run \
+uv run python -m scripts.train_so101 \
+  --profile so101 \
+  --output-dir checkpoints/so101_tiny \
+  --max-steps 30000 \
   --resume
 ```
 
-### 9.2 PyTorch 训练入口内部发生了什么
+恢复时应继续使用原训练参数。代码会恢复模型、optimizer、normalizer 和 flow generator 状态，并拒绝旧 BF16-master 权重混入 FP32-master 训练。
 
-`scripts/train_pytorch.py` 的主调用链：
+## 13. Checkpoint 与 artifact
+
+训练 checkpoint 包含：
 
 ```text
-CLI -> get_config/tyro
--> setup_ddp + select torch.device
--> create_data_loader(framework="pytorch")
--> PI0Pytorch(model_cfg).to(device)
--> load model.safetensors from pytorch_weight_path
--> torch.optim.AdamW + learning-rate schedule
--> training loop
-   -> model(observation, actions)
-   -> loss.backward()
-   -> optimizer.step()
--> save model/optimizer/global_step checkpoint
+step-00007000/
+├── model.safetensors
+├── optimizer.pt
+├── normalizer.safetensors
+├── flow_generator_state.pt
+└── metadata.json
 ```
 
-数据配置和主要超参数仍复用 `TrainConfig`，但不能假设 JAX 专属能力也存在。以 `scripts/train_pytorch.py` 实际实现为准。
+`model.safetensors` 只保存 `requires_grad=True` 的部分，冻结 PaliGemma 每次从本地 HF snapshot 重新加载。部署最少需要：
 
-### 9.3 显存不够怎么办
+```text
+model.safetensors
+normalizer.safetensors
+metadata.json
+```
 
-PyTorch 主线按优先级处理：
+当前可用 artifact 为 `artifacts/pi0_so101_recommended_step7000`。目录名中的 `recommended` 是历史训练命名；其 `metadata.json` 中的架构就是现在的 `SO101_TINY`。部署恢复以 artifact 元数据为准，不依赖 Python 常量名。
 
-1. 开启/保留官方 PyTorch 模型已有的 gradient checkpointing；
-2. 使用 DDP 把 global batch 分配到多张 GPU；
-3. 减小 global batch size（会改变优化条件，学习率可能也要调）；
-4. 只做源码学习时用 PyTorch `debug`，不要把 dummy 模型的结果当 π0 实验结果。
-
-官方当前 PyTorch trainer 不支持 LoRA、FSDP 和 mixed-precision training，因此不能照搬 JAX 低显存配置并期待直接工作。
-
-不要仅把真实配置的模型宽度改小后声称复现 π0；那只是结构实验。
-
-### 9.4 官方 PyTorch 主线
-
-官方仓库的 PyTorch 路线是：先把 JAX `pi0_base` 转成 `model.safetensors`，再交给 `scripts/train_pytorch.py`。这也正是你的自研加载器应参考的参数语义基线。
+## 14. 离线评估
 
 ```bash
-uv run examples/convert_jax_model_to_pytorch.py \
-  --checkpoint_dir ~/.cache/openpi/openpi-assets/checkpoints/pi0_base \
-  --config_name pi0_aloha_sim \
-  --output_path ./converted_checkpoints/pi0_base_pytorch \
-  --precision float32
+uv run python -m scripts.infer_deploy_artifact \
+  --artifact-dir artifacts/pi0_so101_recommended_step7000 \
+  --sample-index 0 \
+  --num-steps 10 \
+  --output-json artifacts/pi0_so101_recommended_step7000/offline-actions.json
 ```
 
-随后在复制出的自定义 `TrainConfig` 中设置：
+检查：
 
-```python
-pytorch_weight_path = "./converted_checkpoints/pi0_base_pytorch"
+- 输出是否为 `[1,50,32]` 且全为有限值；
+- 首动作相对当前 state 的每关节变化；
+- 与录制动作的 MAE；
+- 预测落在训练 q01–q99 内的比例；
+- 推理耗时和峰值显存。
+
+离线 loss 或某个样本通过，不等于真机任务成功。模型可能在闭环中进入未见过的状态，然后重复相似动作。
+
+## 15. 真机部署架构
+
+策略进程使用项目的 `uv` 环境，机器人进程使用 `lerobot` Conda 环境：
+
+```text
+SO101 + cameras
+    -> LeRobot client
+    -> JPEG/state/prompt HTTP request
+    -> Tiny π0 GPU server
+    -> 50×6 action response
+    -> safety gate / LeRobot clipping
+    -> motor command
 ```
 
-单卡/多卡训练入口分别是：
+启动服务：
 
 ```bash
-uv run python scripts/train_pytorch.py pi0_aloha_sim \
-  --exp_name pytorch_baseline
+uv run python -m scripts.serve_so101_policy \
+  --artifact-dir artifacts/pi0_so101_recommended_step7000
 
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 \
-  scripts/train_pytorch.py pi0_aloha_sim \
-  --exp_name pytorch_baseline
+curl http://127.0.0.1:8000/health
 ```
 
-命令参数使用下划线是该 PyTorch 脚本 README 示例的写法。运行前以本地 `--help` 为准。
-
-当前官方 PyTorch 支持不是 JAX 路线的完整功能等价物：仓库说明尚不支持 π0-FAST、mixed precision training、FSDP、LoRA 和 EMA。普通 π0 的单机/DDP 微调与推理可用。你的第一版自研训练器应先对齐普通全量微调；LoRA、EMA、AMP/FSDP 应作为后续明确验证的扩展，不要默认已有官方等价保证。
-
-## 10. checkpoint 的结构与初始化语义
-
-微调 checkpoint 位于：
-
-```text
-checkpoints/pi0_aloha_sim/pi0_foundation_run/<step>/
-```
-
-核心内容包括参数、训练状态及 assets。`CheckpointWeightLoader(pi0_base/params)` 是训练初始化；训练后的某个 `<step>` 目录则是创建推理 policy 的输入。两者不要混淆：
-
-- `pi0_base`：跨机器人基础模型，用来微调；
-- `pi0_aloha_sim/.../20000`：适配 ALOHA Sim 后的策略，可用于相应环境推理。
-
-对你的独立实现而言，“下载到了官方参数”不等于“能够加载”。官方 JAX checkpoint 保存的是与 Flax/NNX 模块树绑定的参数 PyTree；你的类名、层级、专家编号、矩阵轴顺序或 dtype 只要不同，直接加载就会失败或产生错误结果。你需要实现一个明确的转换层：
-
-```text
-Orbax pi0_base checkpoint
--> 展平官方参数 PyTree
--> 官方 key 到自研 key 的映射表
--> 必要的 transpose/reshape/expert slice
--> shape 与 dtype 校验
--> 加载到自研模型
--> 保存为自研 checkpoint 格式
-```
-
-本文只走 **PyTorch 自研路线**：用 `nn.Module` 自己实现，先读官方转换器生成的 safetensors，再映射到你的 state dict。需要理解原始权重转换时，参考 `examples/convert_jax_model_to_pytorch.py` 中的 transpose、Q/K/V 拆分、专家切片和 tied weights 处理；目标 key 应对应你自己的模块，而不是照搬官方 `PI0Pytorch` 类名。
-
-无论选哪种，加载器都必须输出报告：已加载 key、缺失 key、多余 key、每个张量的源/目标 shape、发生过的轴变换。禁止用 `strict=False` 后忽略报告。
-
-## 11. 推理原理：噪声如何变成动作块
-
-`Pi0.sample_actions()`：
-
-1. 图像缩放/预处理；
-2. 计算 prefix token，一次 forward 填充 KV cache；
-3. 初始化 `x_1 ~ N(0, I)`；
-4. 默认使用 10 个 Euler step，`dt=-1/10`；
-5. 每步通过 action expert 预测 `v_t`；
-6. 更新 `x <- x + dt * v_t`，从 `t=1` 积分到 `t=0`；
-7. 得到 `[action_horizon, action_dim]` 动作块。
-
-伪代码：
-
-```python
-x = normal_noise()
-prefix_cache = encode_images_and_prompt(observation)
-for t in [1.0, 0.9, ..., 0.1]:
-    v = action_expert(prefix_cache, state, x, t)
-    x = x - 0.1 * v
-return x
-```
-
-prefix KV cache 避免在 10 次积分中重复编码图像和语言，是推理速度的关键设计。
-
-## 12. 从自己训练的 checkpoint 推理
-
-### 12.1 进程内推理
-
-新建临时学习脚本时可使用以下最小逻辑（也可以直接在 notebook 中运行）：
-
-```python
-from openpi.policies import aloha_policy, policy_config
-from openpi.training import config as train_config
-
-cfg = train_config.get_config("pi0_aloha_sim")
-policy = policy_config.create_trained_policy(
-    cfg,
-    "checkpoints/pi0_aloha_sim/pi0_foundation_run/20000",
-)
-
-example = aloha_policy.make_aloha_example()
-result = policy.infer(example)
-print(result["actions"].shape)  # 通常为 (50, 14)
-print(result["policy_timing"])
-```
-
-`Policy.infer()` 的完整顺序：输入 transform → 加 batch 维 → `Observation.from_dict` → `sample_actions` → 去 batch 维 → output transform。
-
-输出侧顺序是训练输入侧的逆过程：
-
-```text
-model actions
--> Unnormalize
--> data_transforms.outputs
--> robot-native actions
-```
-
-对于 ALOHA，`AlohaOutputs` 裁掉 padding，仅保留 14 维并恢复机器人动作约定。
-
-### 12.2 启动策略服务器
+在 LeRobot 环境做 dry-run：
 
 ```bash
-cd ~/pi0/openpi
-uv run scripts/serve_policy.py policy:checkpoint \
-  --policy.config=pi0_aloha_sim \
-  --policy.dir=checkpoints/pi0_aloha_sim/pi0_foundation_run/20000
+python -m scripts.run_so101_real \
+  --robot-port /dev/serial/by-id/usb-1a86_USB_Single_Serial_5B79017734-if00 \
+  --robot-id my_follower \
+  --front-camera /dev/v4l/by-id/usb-BC-231019-A_XWF-1080P-video-index0 \
+  --wrist-camera /dev/v4l/by-id/usb-XHH-260202-H_Integrated_Camera-video-index0 \
+  --front-camera-fps 30 \
+  --wrist-camera-fps 60 \
+  --control-fps 20 \
+  --num-steps 10 \
+  --actions-per-inference 1 \
+  --max-cycles 10
 ```
 
-服务默认监听 8000 端口。另一个终端运行 ALOHA Sim 客户端：
+`--num-steps` 是一次 Flow Matching 推理的 Euler 积分次数；它不是机器人执行动作的数量。`--actions-per-inference` 才表示一个 50 步预测块中实际发送多少步。
+
+推荐先保持 `actions-per-inference=1`：每执行一步就重新观察和规划。设成 50 会开环执行约 2.5 秒，期间视觉变化无法影响已有动作。
+
+确认 dry-run 后才使用 `--execute`。默认安全顺序是：协议形状和有限值检查 → 策略跳变/训练范围检查 → LeRobot 相对目标裁剪。`--lerobot-safety-only` 只关闭中间一层。
+
+## 16. 为什么当前 demo 容易重复动作
+
+当前真实测试已经说明工程闭环成立，但 step7000 的策略质量有限。重复动作可能来自多项因素叠加：
+
+- 只有单任务、有限 episode，状态覆盖窄；
+- decoder 从随机初始化开始训练，没有官方 π0 action expert 先验；
+- 视觉前端冻结，训练只学习到有限的任务相关对齐；
+- 相似观测加相似 state 容易生成相似 action chunk；
+- 执行过多 chunk 步骤会降低反馈频率；
+- flow loss 最优 checkpoint 不一定是真机成功率最优 checkpoint。
+
+客户端默认 `seed-mode=increment`，避免每轮用完全相同的初始噪声；这能减少严格重复，但不能解决策略本身没有学会状态进展的问题。
+
+## 17. 调试与测试顺序
+
+每次修改建议按以下顺序：
 
 ```bash
-uv run examples/aloha_sim/main.py
+uv run ruff format configs pi0 scripts tests
+uv run ruff check configs pi0 scripts tests
+uv run pytest -q
+uv run python -m scripts.inspect_config
+uv run python -m scripts.inspect_so101_dataset
 ```
 
-架构为：
+`ruff format` 只重排代码格式；`ruff check` 检查未使用 import、导入顺序和常见代码问题；`pytest` 运行行为测试。它们读取 `pyproject.toml` 中的配置，但不会随意修改该文件。
 
-```text
-仿真/机器人客户端 --WebSocket observation--> GPU policy server
-仿真/机器人客户端 <--WebSocket action chunk--- GPU policy server
-```
+## 18. 当前源码学习顺序
 
-机器人控制循环通常不会无条件执行全部 50 步；可每执行若干动作后重新观察、重新规划。重规划间隔越短反馈越及时，但推理频率与网络负载越高。
+按依赖从底层到端到端阅读：
 
-## 13. 关键代码地图
+1. `configs/schema.py`、`configs/tiny.py`、`configs/so101.py`；
+2. `pi0/types.py`、`pi0/processor.py`；
+3. `pi0/rms_norm.py`、`pi0/rope.py`、`pi0/attention.py`、`pi0/mlp.py`；
+4. `pi0/decoder_layer.py`、`pi0/joint_decoder_layer.py`、`pi0/joint_transformer.py`；
+5. `pi0/paligemma_prefix.py`、`pi0/prefix_embedding.py`、`pi0/action_embedding.py`；
+6. `pi0/flow_matching.py`、`pi0/core.py`、`pi0/policy.py`；
+7. `pi0/lerobot_dataset.py`、`pi0/normalization.py`；
+8. `pi0/training.py`、`scripts/train_so101.py`；
+9. `pi0/deployment.py` 和三条推理/真机脚本。
 
-| 学习问题 | 文件/符号 |
-|---|---|
-| π0 默认尺寸、输入规格 | `src/openpi/models/pi0_config.py::Pi0Config` |
-| PyTorch prefix/suffix、loss、sampling | `src/openpi/models_pytorch/pi0_pytorch.py::PI0Pytorch` |
-| PyTorch attention mask | `src/openpi/models_pytorch/pi0_pytorch.py::make_att_2d_masks` |
-| PyTorch 双专家与视觉主干 | `src/openpi/models_pytorch/gemma_pytorch.py` |
-| PyTorch 图像预处理 | `src/openpi/models_pytorch/preprocessing_pytorch.py` |
-| Observation 数据契约 | `src/openpi/models/model.py::Observation` |
-| 图像训练增强 | `src/openpi/models/model.py::preprocess_observation` |
-| π0 模型级 transforms | `src/openpi/training/config.py::ModelTransformFactory` |
-| ALOHA 数据配置 | `src/openpi/training/config.py::LeRobotAlohaDataConfig` |
-| 主线训练配置 | `src/openpi/training/config.py` 中 `pi0_aloha_sim` |
-| 数据集和 transform 顺序 | `src/openpi/training/data_loader.py` |
-| 通用 transforms | `src/openpi/transforms.py` |
-| ALOHA 输入/输出适配 | `src/openpi/policies/aloha_policy.py` |
-| normalization stats | `scripts/compute_norm_stats.py` |
-| PyTorch 训练循环与 DDP | `scripts/train_pytorch.py` |
-| JAX→PyTorch 官方权重转换 | `examples/convert_jax_model_to_pytorch.py` |
-| 权重加载 | `src/openpi/training/weight_loaders.py` |
-| checkpoint 保存恢复 | `src/openpi/training/checkpoints.py` |
-| policy 构造 | `src/openpi/policies/policy_config.py` |
-| 单次推理封装 | `src/openpi/policies/policy.py::Policy.infer` |
-| WebSocket 服务 | `scripts/serve_policy.py` |
-| ALOHA Sim 客户端 | `examples/aloha_sim/main.py` |
+每读完一个模块，先看同名 `tests/test_*.py`。测试给出的输入 shape、异常条件和等价公式，比只看注释更容易确认自己是否真正理解。
 
-## 14. 在 `Tiny_pi0` 中从头搭建配置化兼容实现
+## 19. 完成标准与下一阶段
 
-### 14.1 建议的独立工程边界
+当前仓库已经完成：模型结构、数据 adapter、归一化、训练、验证、checkpoint、KV cache 推理、离线评估、策略服务、SO101 双摄客户端和安全控制。
 
-你的代码以 PyTorch 为唯一训练/部署框架：模型继承 `torch.nn.Module`，batch 使用 `torch.Tensor`，训练使用 autograd/`torch.optim`，checkpoint 首选 safetensors 加独立 JSON 配置。代码不应从官方 `PI0Pytorch` 继承，也不应在自研 forward 中调用官方实现。Tiny 和 Full 必须共用全部模型源文件。推荐目录：
+它最适合回答“π0 风格 VLA 从数据到电机是怎样连接起来的”。若下一阶段目标从学习转为提高任务成功率，应做三件事：
 
-```text
-Tiny_pi0/
-├── configs/
-│   ├── schema.py
-│   ├── tiny.py
-│   ├── full.py
-│   ├── data.py
-│   └── train.py
-├── pi0/
-│   ├── types.py
-│   ├── attention_mask.py
-│   ├── siglip.py
-│   ├── gemma.py
-│   ├── action_expert.py
-│   ├── model.py
-│   ├── flow_matching.py
-│   └── sampler.py
-├── data/
-│   ├── lerobot_dataset.py
-│   ├── transforms.py
-│   ├── normalization.py
-│   ├── aloha_adapter.py
-│   └── collate.py
-├── checkpoints/
-│   ├── read_openpi.py
-│   ├── parameter_map.py
-│   └── save_restore.py
-├── training/
-│   ├── optimizer.py
-│   ├── train_state.py
-│   └── trainer.py
-├── inference/
-│   ├── policy.py
-│   ├── server.py
-│   └── client.py
-├── tests/
-│   ├── test_masks.py
-│   ├── test_transforms.py
-│   ├── test_parameter_loading.py
-│   ├── test_forward_equivalence.py
-│   ├── test_loss_equivalence.py
-│   └── test_sampling_equivalence.py
-└── scripts/
-    ├── compute_norm_stats.py
-    ├── convert_openpi_checkpoint.py
-    ├── train.py
-    └── serve.py
-```
+1. 增加初始姿态、物体位置、光照和失败恢复数据；
+2. 用多个 held-out episode 和真机 rollout 成功率选择 checkpoint；
+3. 将同一数据集与 LeRobot 官方预训练 π0 微调流程做基线对照。
 
-这不是要求一次创建所有空文件，而是模块完成到哪里，测试和脚本就跟到哪里。
-
-禁止出现以下设计：
-
-```python
-if config.profile == "tiny":
-    return tiny_forward(...)
-else:
-    return full_forward(...)
-```
-
-正确设计是同一个 forward 自然读取 `config.depth/width/num_heads`。这样在服务器从 Tiny 切到 Full 时，只允许改配置、checkpoint 路径、device/batch 和训练资源参数；任何模型源码改动都意味着“同构复刻”尚未完成。
-
-### 14.2 正确的实现顺序
-
-按依赖关系逐层实现：
-
-1. `Observation/Actions` 数据契约、shape assertion；
-2. attention mask、sin/cos 时间编码、RMSNorm、RoPE 等纯函数；
-3. Gemma attention/MLP 和双 expert 参数布局；
-4. SigLIP 图像编码器及图像 token 输出；
-5. prefix/suffix embedding 和完整 forward；
-6. flow matching 样本构造与 loss；
-7. Euler sampler 与 prefix KV cache；
-8. Tiny 单 batch overfit、保存恢复和 mock serving；
-9. 数据集、transforms、normalization、batch loader；
-10. optimizer、EMA、保存/恢复和训练循环；
-11. policy 输入/输出逆变换；
-12. server/client 与机器人安全执行层；
-13. 在服务器切换 Full 配置；
-14. 官方 checkpoint 转换、参数加载和逐层数值对齐。
-
-参数加载放在 Tiny 全链路稳定、Full 模型能无代码改动实例化之后。Tiny shape 与官方参数不匹配是预期行为，不要裁剪官方权重硬塞进 Tiny。未验证 Full 官方权重加载前，不要开始昂贵微调。
-
-### 14.3 官方实现与自研实现的对齐协议
-
-完整数值对齐只在服务器 Full profile 上执行：同一份输入分别送进官方 `PI0Pytorch` 和你的 Full PyTorch 实现。比较时必须固定：
-
-- 完全相同的预处理后 batch；
-- eval mode，关闭图像随机增强；
-- 相同参数和 dtype；
-- 相同的 flow `t`、高斯噪声 `ε` 和采样初始 noise；
-- 相同 attention mask、position ids 和 `num_steps`。
-
-直接和 `openpi.models_pytorch.pi0_pytorch.PI0Pytorch` 对齐。两边使用相同的 torch tensor、device 和 dtype，可以逐层 hook 中间结果，不需要把 JAX 纳入日常测试。只有转换官方原始 checkpoint 出错时，才检查 Flax Linear `[in,out]`↔PyTorch Linear `[out,in]`、QKV 切片等跨框架布局规则。
-
-按层级验收，不要只比较最终动作：
-
-| 层级 | 对齐对象 | 验收内容 |
-|---|---|---|
-| 数据 | transform 后字典 | key、shape、dtype、数值 |
-| 视觉 | image tokens | shape、均值/方差、逐元素误差 |
-| 文本 | token ids/embedding | tokenizer 输出和 embedding |
-| mask | attention mask/positions | 完全相等 |
-| prefix | prefix hidden states | 数值误差在 dtype 合理范围内 |
-| suffix | state/action/time tokens | 完全相同语义与排列 |
-| 模型 | predicted velocity `v_t` | 固定输入下近似相等 |
-| 训练 | per-element loss/grad | loss 近似相等，关键梯度方向一致 |
-| 推理 | 每个 Euler step 的 `x_t` | 误差不随 step 异常放大 |
-
-具体容差应按 float32/bfloat16 和设备实测设定，不要武断规定一个全局阈值。先记录绝对误差、相对误差和 cosine similarity，再为每类张量制定阈值。
-
-### 14.4 官方参数加载的完成标准
-
-参数转换器至少完成以下检查：
-
-```text
-源 checkpoint 可读取
--> 每个官方 tensor 有确定去向或明确标为不需要
--> 每个自研 trainable tensor 都已初始化
--> shape 全部匹配
--> dtype 转换明确
--> 参数数量和总元素数可解释
--> 固定 batch 的 v_t 与官方实现对齐
--> 固定 noise 的完整 action chunk 与官方实现对齐
-```
-
-最后两项才是真正证明“官方参数已经正确加载”。单纯显示 `load_state_dict succeeded` 不足以验收。
-
-### 14.5 自采数据接口
-
-先定义机器人无关的 canonical sample，再写采集格式到 canonical sample 的 adapter：
-
-```python
-sample = {
-    "image": {
-        "base_0_rgb": uint8_hwc,
-        "left_wrist_0_rgb": uint8_hwc,
-        "right_wrist_0_rgb": uint8_hwc,
-    },
-    "image_mask": {...},
-    "state": float32_state,
-    "actions": float32_future_action_chunk,
-    "prompt": "pick up the object",
-}
-```
-
-数据采集阶段还要保存时间戳、episode 边界、控制频率、相机标定/语义、state/action 单位、关节顺序、失败/成功标签和软件版本。构造 action chunk 时不得跨 episode；末尾 padding 策略必须明确。train/validation split 应按 episode 或场景划分，不能随机打散相邻帧造成泄漏。
-
-### 14.6 自研训练器的最低功能
-
-你的训练器应亲自实现并测试：seed 管理、batch sharding/设备搬运、forward/loss、梯度计算、梯度裁剪（若配置启用）、AdamW、学习率调度、冻结参数、EMA、日志、定期保存、断点恢复以及异常数值检查。
-
-第一轮不要追求分布式和极致性能：先在 dummy 模型上 overfit 一个 batch，再在少量真实数据上 overfit 一个 episode，确认 loss 能显著下降且 checkpoint 恢复后完全连续，最后才上完整数据。
-
-本项目的 SO101 训练还遵守两条不可省略的数值约束：
-
-1. 从零初始化的 projection 和双专家参数、梯度、AdamW moments 必须保持 FP32；
-   RTX 4090 只通过 BF16 autocast 降低矩阵计算和 activation 成本。不要把可训练参数
-   本身直接转换成 BF16，否则 `1e-4` 以下的更新可能在写回权重时被舍入掉。
-2. 模型保留32维动作契约，但 SO101 只有前6维是真实关节。训练 loss、初始 flow
-   noise 和 Euler 更新都必须使用 action-dimension mask；后26维始终为0，不能让
-   padding 维主导 loss 或成为随机干扰输入。
-
-验证不能只记录 flow velocity MSE。当前训练器还会用固定随机种子运行完整动作采样，
-记录真实动作维的 action chunk MAE 和 first-action MAE，并逐步追加到
-`metrics.jsonl`。只有这些物理动作指标持续改善，checkpoint 才有进入离线安全验证的
-资格。
-
-### 14.7 自研部署架构
-
-建议把部署拆成四层：
-
-```text
-Robot Adapter
-  采集相机/状态，统一时间戳和字段
-        ↓
-Policy Client
-  编码请求、超时、重试、action chunk 缓冲
-        ↓ WebSocket/其他 RPC
-Inference Server
-  preprocess -> model sampler -> postprocess
-        ↓
-Safety & Control Executor
-  限位、限速、插值、碰撞检查、watchdog、急停
-```
-
-训练/推理必须复用同一份输入 transform、normalization stats 和输出逆变换。服务端启动时应校验 model checkpoint、stats、robot adapter schema 和配置版本，避免“模型能加载但动作语义不匹配”。部署验收顺序是：离线录制数据回放 → 仿真/数字孪生 → 真机低速空载 → 单任务小范围 → 正常运行。
-
-## 15. 推荐的五阶段 Tiny→Full 路线
-
-### 阶段 A：建立配置骨架与 Tiny 模型
-
-- 建立 `schema.py`、`tiny.py`、`full.py`；
-- 只实现一个 `Pi0Model(config)`；
-- 实现 Tiny 视觉主干、语言主干、Action Expert 和投影层；
-- 打印参数量、每层 shape 和显存峰值；
-- 手画 prefix/suffix 与 attention mask。
-
-验收：Tiny forward/backward 能在 4 GB 本机运行，代码中不存在 Tiny 专属 forward。
-
-### 阶段 B：本机打通 Tiny 训练和数据
-
-- 使用少量公开或自采 episode；
-- 在每一级 transform 后打印 key、shape、dtype、min/max；
-- 运行 normalization stats；
-- 验证 action chunk 的时间窗口；
-- overfit 单 batch 和单 episode；
-- 验证 checkpoint 恢复后 loss 连续。
-
-验收：Tiny 使用完整数据契约完成训练、保存、恢复和 Euler sampling。
-
-### 阶段 C：本机打通 Tiny 部署闭环
-
-- 启动 Tiny policy server；
-- 用 Mock Robot Client 发送图像、状态和 prompt；
-- 实现超时、重连、action chunk buffer 和 watchdog；
-- 用录制数据离线回放；
-- 验证输入/输出 transform 可逆。
-
-验收：本机能从 observation 请求完整走到安全处理后的 action chunk。
-
-### 阶段 D：服务器切换 Full 并加载官方参数
-
-- 只把 profile 从 `tiny` 改为 `full`；
-- 确认没有修改模型源文件；
-- 实现 checkpoint key 映射与转换报告；
-- 加载转换后的 `pi0_base` safetensors；
-- 对齐固定 `t/noise` 下的 `v_t`；
-- 对齐每个 Euler step 和最终 action chunk。
-
-验收：Full 自研模型不调用官方 forward，却能加载 `pi0_base` 并在固定输入下复现官方 PyTorch 输出。
-
-### 阶段 E：真机数据微调与远程部署
-
-- 将数据转成 LeRobot；
-- 明确相机、state、action 的单位和坐标系；
-- 新建 Inputs/Outputs；
-- 新建 DataConfigFactory 和 TrainConfig；
-- 计算新 stats；
-- 先取一个 batch，再做短训练，最后才跑长训练；
-- 部署时加动作限幅、安全检查和急停。
-
-验收：训练与推理共用同一对可逆的 robot-specific transforms。
-
-## 16. 自定义机器人时的最小改造清单
-
-1. 数据字段能表示当前观测和未来动作序列；
-2. 明确真实 action dim 与模型 padding dim；
-3. 固定每一路相机语义，不要训练/部署时互换；
-4. 缺失视角补黑图，同时正确设置 `image_mask=False`；
-5. state/action 单位、关节顺序和 gripper 约定完全一致；
-6. 决定 absolute 还是 delta action，并提供对应逆变换；
-7. prompt 对每个样本可用；
-8. 重新计算 normalization stats；
-9. policy 输出要反归一化并恢复机器人原生坐标；
-10. 真机执行前必须限幅、限速、碰撞检查和急停。
-
-## 17. 最容易踩的坑
-
-### 配置名字和模型类型混淆
-
-始终打印 `cfg.model.model_type` 和 `cfg.model.pi05`。不要因文件都叫 `pi0_config.py` 就认为 π0.5 与 π0 数据处理相同。
-
-### 忘记子模块或绕过 uv
-
-统一使用 `uv run ...`；安装后仍执行一次 `git submodule update --init --recursive`。
-
-### 没算 norm stats
-
-错误通常会直接提示运行 `compute_norm_stats.py`。不要通过 `skip_norm_stats=True` 来开始正式训练。
-
-### transforms 训练/推理不对称
-
-训练中做过 delta action、坐标转换、归一化，推理输出必须逆变换。否则 loss 可能下降，但机器人动作完全错误。
-
-### 图像布局错误
-
-外部 ALOHA 示例接收 CHW，`AlohaInputs` 转成 HWC；模型统一使用 HWC。自定义输入若本来已经 HWC，不能再次错误转置。
-
-### 直接让 base checkpoint 控制新机器人
-
-`pi0_base` 是微调初始化，不是任意机器人的即插即用策略。至少需要匹配的适配层、stats 和目标机器人数据。
-
-### `--overwrite` 与 `--resume` 同时使用
-
-配置会拒绝两者同时开启。恢复训练仅使用 `--resume`。
-
-### “训练跑起来”等于“复现成功”
-
-最低验收应包括：字段/shape 正确、归一化可逆、loss 有效、checkpoint 可恢复、离线动作分布合理、仿真任务评估可重复。
-
-### 把 Tiny 权重当成官方预训练权重
-
-Tiny 和 Full 只共享架构代码，不共享参数 shape。Tiny checkpoint 只能验证训练系统和部署链路，不能作为 `pi0_base` 的替代品，也不能通过补零/裁剪变成官方 Full 权重。
-
-### 切到 Full 时顺手修改 forward
-
-从本机到服务器只应切换配置和运行资源。如果为了 Full 另外写 attention、loss 或 sampler 分支，Tiny 阶段测试过的就不是最终架构。
-
-## 18. 建议做的源码实验
-
-1. 用很小的布尔数组调用 `make_attn_mask()`，打印矩阵；
-2. 固定 observation 和 noise，改变 `num_steps` 比较动作；
-3. 固定 observation 与 RNG，验证推理可重复性；
-4. 将一批 actions Normalize 再 Unnormalize，检查最大重建误差；
-5. 在每层 transform 后断言 key、shape、dtype；
-6. 比较训练态图像增强前后，但不要改正式验证输入；
-7. 检查缺失 wrist camera 时黑图和 mask 是否成对出现；
-8. 加载保存后的 checkpoint，确认相同 noise 下输出一致。
-
-## 19. 端到端复现清单
-
-- [ ] `git submodule update --init --recursive` 成功
-- [ ] `uv sync` 与 editable install 成功
-- [ ] PyTorch 能看到 NVIDIA GPU
-- [ ] Tiny profile 在 4 GB 显存内完成 forward/backward
-- [ ] Tiny 与 Full 由同一个 `Pi0Model` 实例化
-- [ ] 模型 forward 中不存在基于 profile 名称的算法分支
-- [ ] 能解释 π0 prefix/suffix 与 flow matching loss
-- [ ] Tiny 保持正式 observation/action 数据契约
-- [ ] Tiny 单 batch 与单 episode overfit 成功
-- [ ] `compute_norm_stats.py` 成功生成 assets
-- [ ] 训练 loss、学习率和吞吐有记录
-- [ ] checkpoint 可保存并恢复
-- [ ] Tiny policy server、Mock Client 和 action buffer 连通
-- [ ] `Tiny_pi0` 的模型 forward 不调用 openpi 官方 forward
-- [ ] 自研模型、训练器与部署路径均以 PyTorch 实现
-- [ ] 服务器仅切换配置即可实例化 Full，模型源码无改动
-- [ ] Full `pi0_base` 权重成功加载
-- [ ] 官方参数到自研参数的映射报告无未解释项
-- [ ] 固定 batch、`t`、noise 时自研 `v_t` 与官方结果对齐
-- [ ] 自研 Euler sampler 的逐步结果与官方结果对齐
-- [ ] 自采数据按 episode 划分且 action chunk 不跨 episode
-- [ ] Full policy server/client 完成离线回放和仿真验收
-- [ ] 能说明为何无法从公开材料重建官方完整基础预训练
-
-## 20. 一条最短官方基线路线
-
-下面命令只负责在服务器建立“官方标准答案”，不应在 4 GB 本机强行执行。你的本机主线是第 5.2、14、15 节的 Tiny profile；服务器阶段再运行以下转换和 Full 基线。
-
-```bash
-cd ~/pi0/openpi
-git submodule update --init --recursive
-GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
-
-# 1. 安装官方 PyTorch 实现需要的 transformers patch
-uv pip install transformers==4.53.2
-cp -r ./src/openpi/models_pytorch/transformers_replace/* \
-  .venv/lib/python3.11/site-packages/transformers/
-
-# 2. 验证 PyTorch 训练骨架
-uv run scripts/train_pytorch.py debug --exp_name pytorch_debug
-
-# 3. 为真实公开数据计算统计量（该工具可继续复用）
-uv run scripts/compute_norm_stats.py --config-name pi0_aloha_sim
-
-# 4. 下载官方 pi0_base
-uv run python - <<'PY'
-from openpi.shared import download
-print(download.maybe_download("gs://openpi-assets/checkpoints/pi0_base"))
-PY
-
-# 5. 把官方 Orbax 权重一次性转换为 PyTorch safetensors
-uv run examples/convert_jax_model_to_pytorch.py \
-  --checkpoint_dir ~/.cache/openpi/openpi-assets/checkpoints/pi0_base \
-  --config_name pi0_aloha_sim \
-  --output_path ./converted_checkpoints/pi0_base_pytorch \
-  --precision float32
-
-# 6. 在自定义 TrainConfig 中设置 pytorch_weight_path 后启动 PyTorch 微调
-uv run scripts/train_pytorch.py <你的_pi0配置名> \
-  --exp_name pytorch_pi0_finetune
-```
-
-其中自定义配置需要包含：
-
-```python
-pytorch_weight_path = "./converted_checkpoints/pi0_base_pytorch"
-```
-
-完成这条官方 PyTorch 路线后，你获得的是可执行参考；完成第 14 节的独立 PyTorch 实现、参数加载和数值对齐后，才算真正具备端到端实现能力。这套能力也是后续 π0-FAST、π0.5 乃至其他 VLA 会复用的地基：统一 observation/action 契约、机器人数据适配、action chunk、条件生成、预训练权重迁移、归一化资产、checkpoint 和远程 policy serving。
+这样，Tiny π0 保留为透明、可解释的教学基线，官方预训练模型负责验证大规模先验对真实任务效果的提升。

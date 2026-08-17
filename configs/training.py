@@ -71,11 +71,3 @@ class TrainingConfig:
     @property
     def effective_batch_size(self) -> int:
         return self.micro_batch_size * self.gradient_accumulation_steps
-
-
-SO101_4090_TRAINING = TrainingConfig(
-    output_dir=Path("checkpoints/so101_recommended"),
-    micro_batch_size=4,
-    gradient_accumulation_steps=8,
-    gradient_checkpointing=True,
-)

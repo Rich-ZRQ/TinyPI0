@@ -9,8 +9,7 @@ import tyro
 from torch.utils.data import DataLoader
 
 from configs import (
-    SO101_LARGE,
-    SO101_RECOMMENDED,
+    SO101_TINY,
     TINY_PI0,
     Pi0Config,
     TrainingConfig,
@@ -30,8 +29,8 @@ from pi0.training import Pi0Trainer, latest_checkpoint, split_episode_ids
 class Args:
     dataset_root: Path = Path.home() / ".cache/huggingface/lerobot/Rich-RZ/so101_chocolates_to_bowl_v1"
     paligemma_snapshot: Path | None = None
-    output_dir: Path = Path("checkpoints/so101_recommended")
-    profile: Literal["tiny", "recommended", "large"] = "recommended"
+    output_dir: Path = Path("checkpoints/so101_tiny")
+    profile: Literal["debug", "so101"] = "so101"
     max_steps: int = 30_000
     micro_batch_size: int = 4
     gradient_accumulation_steps: int = 8
@@ -68,12 +67,10 @@ def find_paligemma_snapshot(explicit_path: Path | None) -> Path:
 
 
 def select_model_config(profile: str) -> Pi0Config:
-    if profile == "tiny":
+    if profile == "debug":
         return TINY_PI0
-    if profile == "recommended":
-        return SO101_RECOMMENDED
-    if profile == "large":
-        return SO101_LARGE
+    if profile == "so101":
+        return SO101_TINY
     raise ValueError(f"Unknown model profile: {profile}")
 
 

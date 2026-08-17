@@ -1,4 +1,4 @@
-"""Configuration definitions shared by Tiny and Full pi0."""
+"""Architecture configuration definitions for Tiny pi0."""
 
 from dataclasses import dataclass
 from typing import Literal
@@ -149,20 +149,3 @@ class Pi0Config:
                     f"got {paligemma_value} and "
                     f"{action_expert_value}"
                 )
-
-
-@dataclass(frozen=True)
-class RuntimeConfig:
-    """Settings that affect execution but not model architecture."""
-
-    batch_size: int = 1
-    gradient_checkpointing: bool = False
-    compile_model: bool = False
-    num_workers: int = 0
-
-    def __post_init__(self) -> None:
-        if self.batch_size <= 0:
-            raise ValueError(f"batch_size must be positive, got {self.batch_size}")
-
-        if self.num_workers < 0:
-            raise ValueError(f"num_workers must be non-negative, got {self.num_workers}")

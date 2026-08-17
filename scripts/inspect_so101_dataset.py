@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from configs import SO101_RECOMMENDED
+from configs import SO101_TINY
 from pi0.lerobot_dataset import LeRobotPi0Dataset, load_lerobot_normalizer
 
 DATASET_ROOT = Path.home() / ".cache/huggingface/lerobot/Rich-RZ/so101_chocolates_to_bowl_v1"
@@ -11,7 +11,7 @@ DATASET_ROOT = Path.home() / ".cache/huggingface/lerobot/Rich-RZ/so101_chocolate
 def main() -> None:
     dataset = LeRobotPi0Dataset(
         root=DATASET_ROOT,
-        config=SO101_RECOMMENDED,
+        config=SO101_TINY,
     )
     sample = dataset[0]
     normalizer = load_lerobot_normalizer(DATASET_ROOT)
