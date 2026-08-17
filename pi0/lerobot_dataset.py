@@ -31,6 +31,7 @@ class Pi0TrainingSample:
     state: Tensor
     actions: Tensor
     action_valid_mask: Tensor
+    action_dim_mask: Tensor
     episode_index: int
     frame_index: int
     timestamp: float
@@ -43,6 +44,7 @@ class Pi0TrainingBatch:
     observation: Observation
     actions: Tensor
     action_valid_mask: Tensor
+    action_dim_mask: Tensor
 
     def masked_mean_loss(self, per_step_loss: Tensor) -> Tensor:
         """Average a [B, H] loss over non-padding action steps."""
@@ -217,6 +219,7 @@ class LeRobotPi0Dataset(Dataset[Pi0TrainingSample]):
             state=self.states[global_index],
             actions=actions,
             action_valid_mask=action_valid_mask,
+            action_dim_mask=torch.arange(self.config.action_dim) < self.robot_action_dim,
             episode_index=episode_index,
             frame_index=int(self.frame_indices[global_index]),
             timestamp=timestamp,
@@ -366,6 +369,7 @@ class Pi0DataCollator:
             observation=observation,
             actions=torch.stack([sample.actions for sample in samples]),
             action_valid_mask=torch.stack([sample.action_valid_mask for sample in samples]),
+            action_dim_mask=torch.stack([sample.action_dim_mask for sample in samples]),
         )
 
 

@@ -25,6 +25,15 @@ class StepMetrics:
     learning_rate: float
     grad_norm: float
     validation_loss: float | None = None
+    validation_action_mae: float | None = None
+    validation_first_action_mae: float | None = None
+
+
+@dataclass(frozen=True)
+class ValidationMetrics:
+    loss: float
+    action_mae: float
+    first_action_mae: float
 
 
 def split_episode_ids(
@@ -78,6 +87,18 @@ def create_optimizer(model: nn.Module, config: TrainingConfig) -> torch.optim.Ad
     if not parameters:
         raise ValueError("Model has no trainable parameters")
 
+    low_precision = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.dtype != torch.float32
+    ]
+
+    if low_precision:
+        raise TypeError(
+            "Trainable parameters must remain FP32 so AdamW keeps FP32 master weights and moments; "
+            f"low-precision parameters include {low_precision[:8]}"
+        )
+
     return torch.optim.AdamW(
         parameters,
         lr=cosine_learning_rate(0, config),
@@ -104,6 +125,7 @@ def save_checkpoint(
     config: TrainingConfig,
     step: int,
     flow_generator: torch.Generator | None = None,
+    metrics: StepMetrics | None = None,
 ) -> Path:
     """Atomically save trainable weights, optimizer state and run metadata."""
 
@@ -116,7 +138,12 @@ def save_checkpoint(
         shutil.rmtree(temporary_path)
     temporary_path.mkdir(parents=True)
 
-    save_file(trainable_state_dict(model), temporary_path / "model.safetensors")
+    learned_state = trainable_state_dict(model)
+
+    if not learned_state:
+        raise ValueError("Model has no trainable parameters to checkpoint")
+
+    save_file(learned_state, temporary_path / "model.safetensors")
     torch.save(optimizer.state_dict(), temporary_path / "optimizer.pt")
 
     normalizer = getattr(model, "normalizer", None)
@@ -143,7 +170,11 @@ def save_checkpoint(
     metadata = {
         "step": step,
         "training_config": serialized_config,
+        "trainable_dtype": str(next(iter(learned_state.values())).dtype).removeprefix("torch."),
     }
+
+    if metrics is not None:
+        metadata["metrics"] = asdict(metrics)
 
     model_config = getattr(model, "config", None)
 
@@ -204,12 +235,25 @@ def load_checkpoint(
             raise FileNotFoundError(required_path)
 
     weights = load_file(weights_path, device=str(device))
-    trainable_names = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+    trainable_parameters = {name: parameter for name, parameter in model.named_parameters() if parameter.requires_grad}
+    trainable_names = set(trainable_parameters)
 
     if set(weights) != trainable_names:
         missing = sorted(trainable_names - set(weights))
         unexpected = sorted(set(weights) - trainable_names)
         raise ValueError(f"Checkpoint parameter mismatch: missing={missing}, unexpected={unexpected}")
+
+    dtype_mismatches = [
+        f"{name}: checkpoint={weights[name].dtype}, model={parameter.dtype}"
+        for name, parameter in trainable_parameters.items()
+        if weights[name].dtype != parameter.dtype
+    ]
+
+    if dtype_mismatches:
+        raise TypeError(
+            "Training checkpoint dtype mismatch. Do not resume a legacy BF16-master run as FP32 training; "
+            f"restart training instead. Mismatches include {dtype_mismatches[:8]}"
+        )
 
     model.load_state_dict(weights, strict=False)
 
@@ -266,6 +310,7 @@ class Pi0Trainer:
         self.optimizer = create_optimizer(policy, config)
         self.loss_function = policy.compute_loss
         self.flow_generator = torch.Generator(device=self.device).manual_seed(config.seed)
+        self.autocast_enabled = config.bfloat16_autocast and self.device.type == "cuda"
 
         if config.compile_model:
             self.loss_function = torch.compile(self.loss_function)
@@ -317,12 +362,14 @@ class Pi0Trainer:
                     device=self.device,
                     generator=self.flow_generator,
                 )
-                per_step_loss = self.loss_function(
-                    batch.observation,
-                    batch.actions,
-                    noise=noise,
-                    timestep=timestep,
-                )
+                with self._autocast():
+                    per_step_loss = self.loss_function(
+                        batch.observation,
+                        batch.actions,
+                        noise=noise,
+                        timestep=timestep,
+                        action_dim_mask=batch.action_dim_mask,
+                    )
                 loss = batch.masked_mean_loss(per_step_loss)
 
                 if not torch.isfinite(loss):
@@ -363,10 +410,10 @@ class Pi0Trainer:
 
                 global_step += 1
 
-                validation_loss = None
+                validation_metrics = None
 
                 if global_step % self.config.validation_interval == 0:
-                    validation_loss = self.validate()
+                    validation_metrics = self.validate()
                     self.policy.train()
 
                 train_loss = accumulated_loss / accumulation_count
@@ -375,10 +422,15 @@ class Pi0Trainer:
                     train_loss=train_loss,
                     learning_rate=learning_rate,
                     grad_norm=float(grad_norm),
-                    validation_loss=validation_loss,
+                    validation_loss=(None if validation_metrics is None else validation_metrics.loss),
+                    validation_action_mae=(None if validation_metrics is None else validation_metrics.action_mae),
+                    validation_first_action_mae=(
+                        None if validation_metrics is None else validation_metrics.first_action_mae
+                    ),
                 )
                 metrics.append(step_metrics)
                 self._print_metrics(step_metrics)
+                self._record_metrics(step_metrics, resume=resume)
                 accumulation_count = 0
                 accumulated_loss = 0.0
 
@@ -389,6 +441,7 @@ class Pi0Trainer:
                         config=self.config,
                         step=global_step,
                         flow_generator=self.flow_generator,
+                        metrics=step_metrics,
                     )
 
                 if global_step >= self.config.max_steps:
@@ -404,16 +457,21 @@ class Pi0Trainer:
                 config=self.config,
                 step=global_step,
                 flow_generator=self.flow_generator,
+                metrics=metrics[-1],
             )
 
         return metrics
 
     @torch.no_grad()
-    def validate(self) -> float:
-        """Compute a stable masked validation loss over a bounded number of batches."""
+    def validate(self) -> ValidationMetrics:
+        """Compute velocity loss and physical-action metrics on held-out episodes."""
 
         self.policy.eval()
         losses: list[float] = []
+        action_absolute_error = 0.0
+        action_element_count = 0
+        first_action_absolute_error = 0.0
+        first_action_element_count = 0
         generator = torch.Generator(device=self.device).manual_seed(self.config.seed + 1)
 
         for batch_index, batch in enumerate(self.validation_loader):
@@ -428,12 +486,14 @@ class Pi0Trainer:
                 generator=generator,
             )
             timestep = ((torch.arange(batch_size, device=self.device, dtype=torch.float32) + batch_index) % 9 + 1) / 10
-            per_step_loss = self.loss_function(
-                batch.observation,
-                batch.actions,
-                noise=noise,
-                timestep=timestep,
-            )
+            with self._autocast():
+                per_step_loss = self.loss_function(
+                    batch.observation,
+                    batch.actions,
+                    noise=noise,
+                    timestep=timestep,
+                    action_dim_mask=batch.action_dim_mask,
+                )
             loss = batch.masked_mean_loss(per_step_loss)
 
             if not torch.isfinite(loss):
@@ -441,10 +501,47 @@ class Pi0Trainer:
 
             losses.append(float(loss))
 
+            if batch_index < self.config.validation_action_batches:
+                sampling_noise = torch.randn(
+                    batch.actions.shape,
+                    device=self.device,
+                    dtype=self.policy.model_dtype,
+                    generator=generator,
+                )
+                with self._autocast():
+                    predicted_actions = self.policy.sample_actions(
+                        batch.observation,
+                        num_steps=self.config.validation_sampling_steps,
+                        noise=sampling_noise,
+                        action_dim_mask=batch.action_dim_mask,
+                    )
+                target_actions = batch.actions.to(
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                time_mask = batch.action_valid_mask.to(device=self.device)[:, :, None]
+                dimension_mask = batch.action_dim_mask.to(device=self.device)[:, None, :]
+                action_mask = time_mask & dimension_mask
+                absolute_error = (predicted_actions - target_actions).abs()
+                action_absolute_error += float((absolute_error * action_mask).sum())
+                action_element_count += int(action_mask.sum())
+
+                first_mask = batch.action_dim_mask.to(device=self.device)
+                first_error = absolute_error[:, 0, :]
+                first_action_absolute_error += float((first_error * first_mask).sum())
+                first_action_element_count += int(first_mask.sum())
+
         if not losses:
             raise RuntimeError("Validation loader produced no batches")
 
-        return sum(losses) / len(losses)
+        if action_element_count == 0 or first_action_element_count == 0:
+            raise RuntimeError("Validation action masks contain no real robot dimensions")
+
+        return ValidationMetrics(
+            loss=sum(losses) / len(losses),
+            action_mae=action_absolute_error / action_element_count,
+            first_action_mae=first_action_absolute_error / first_action_element_count,
+        )
 
     @staticmethod
     def _print_metrics(metrics: StepMetrics) -> None:
@@ -456,4 +553,27 @@ class Pi0Trainer:
         if metrics.validation_loss is not None:
             message += f" validation_loss={metrics.validation_loss:.6f}"
 
+        if metrics.validation_action_mae is not None:
+            message += f" validation_action_mae={metrics.validation_action_mae:.4f}"
+
+        if metrics.validation_first_action_mae is not None:
+            message += f" validation_first_action_mae={metrics.validation_first_action_mae:.4f}"
+
         print(message, flush=True)
+
+    def _record_metrics(self, metrics: StepMetrics, *, resume: bool) -> None:
+        path = Path(self.config.output_dir) / "metrics.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if metrics.step == 1 and not resume:
+            path.write_text("", encoding="utf-8")
+
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(asdict(metrics)) + "\n")
+
+    def _autocast(self) -> torch.autocast:
+        return torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.bfloat16,
+            enabled=self.autocast_enabled,
+        )

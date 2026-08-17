@@ -23,7 +23,7 @@ from pi0.lerobot_dataset import (
 from pi0.paligemma_prefix import PaliGemmaPrefixEncoder
 from pi0.policy import Pi0Policy
 from pi0.processor import Pi0Processor
-from pi0.training import Pi0Trainer, split_episode_ids
+from pi0.training import Pi0Trainer, latest_checkpoint, split_episode_ids
 
 
 @dataclass(frozen=True)
@@ -33,18 +33,20 @@ class Args:
     output_dir: Path = Path("checkpoints/so101_recommended")
     profile: Literal["tiny", "recommended", "large"] = "recommended"
     max_steps: int = 30_000
-    micro_batch_size: int = 8
-    gradient_accumulation_steps: int = 4
-    learning_rate: float = 2.5e-5
-    end_learning_rate: float = 2.5e-6
+    micro_batch_size: int = 4
+    gradient_accumulation_steps: int = 8
+    learning_rate: float = 1e-4
+    end_learning_rate: float = 1e-5
     warmup_steps: int = 1_000
     decay_steps: int | None = None
     num_workers: int = 4
     validation_fraction: float = 0.1
     validation_interval: int = 500
     validation_batches: int = 32
+    validation_action_batches: int = 1
+    validation_sampling_steps: int = 10
     checkpoint_interval: int = 1_000
-    gradient_checkpointing: bool = False
+    gradient_checkpointing: bool = True
     compile_model: bool = False
     resume: bool = False
     seed: int = 42
@@ -79,6 +81,14 @@ def main(args: Args) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("SO101 training requires a CUDA GPU")
 
+    existing_checkpoint = latest_checkpoint(args.output_dir)
+
+    if existing_checkpoint is not None and not args.resume:
+        raise FileExistsError(
+            f"Found existing checkpoint {existing_checkpoint}. Use a new --output-dir for a clean run, "
+            "or pass --resume only for a checkpoint created by the fixed FP32-master trainer."
+        )
+
     # Model initialization must be seeded before constructing the trainable core.
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -100,6 +110,8 @@ def main(args: Args) -> None:
         validation_fraction=args.validation_fraction,
         validation_interval=args.validation_interval,
         validation_batches=args.validation_batches,
+        validation_action_batches=args.validation_action_batches,
+        validation_sampling_steps=args.validation_sampling_steps,
         checkpoint_interval=args.checkpoint_interval,
         gradient_checkpointing=args.gradient_checkpointing,
         compile_model=args.compile_model,
@@ -163,6 +175,9 @@ def main(args: Args) -> None:
         config=model_config,
         prefix_encoder=prefix_encoder,
         normalizer=normalizer,
+        # Keep master parameters and Adam states in FP32. The trainer uses
+        # BF16 autocast for matrix multiplications on Ampere/Ada GPUs.
+        trainable_dtype=torch.float32,
     )
     trainer = Pi0Trainer(
         policy=policy,
@@ -175,11 +190,13 @@ def main(args: Args) -> None:
     print("Device:", device)
     print("Frozen frontend dtype:", dtype)
     print("Trainable dtype:", policy.model_dtype)
+    print("BF16 autocast:", training_config.bfloat16_autocast)
     print("Profile:", args.profile)
     print("Train/validation episodes:", len(train_episodes), len(validation_episodes))
     print("Train/validation frames:", len(train_dataset), len(validation_dataset))
     print("Micro/effective batch:", training_config.micro_batch_size, training_config.effective_batch_size)
     print("Trainable parameters:", trainable_parameters)
+    print("Metrics:", training_config.output_dir / "metrics.jsonl")
 
     trainer.fit(resume=args.resume)
 

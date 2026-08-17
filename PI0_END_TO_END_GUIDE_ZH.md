@@ -55,7 +55,7 @@ LeRobot 原始样本
 
 ```python
 pi0_config.Pi0Config(pi05=False)  # π0
-pi0_config.Pi0Config(pi05=True)   # π0.5
+pi0_config.Pi0Config(pi05=True)  # π0.5
 ```
 
 本文避免使用 `pi05_*` 和 `pi0_fast_*` 配置。
@@ -234,6 +234,7 @@ Pi0Config(
 ```python
 from dataclasses import dataclass
 
+
 @dataclass(frozen=True)
 class TransformerConfig:
     width: int
@@ -243,6 +244,7 @@ class TransformerConfig:
     num_kv_heads: int
     head_dim: int
 
+
 @dataclass(frozen=True)
 class VisionConfig:
     image_size: int
@@ -251,6 +253,7 @@ class VisionConfig:
     depth: int
     mlp_dim: int
     num_heads: int
+
 
 @dataclass(frozen=True)
 class Pi0Config:
@@ -262,6 +265,7 @@ class Pi0Config:
     action_horizon: int = 50
     max_token_len: int = 48
     dtype: str = "float32"
+
 
 @dataclass(frozen=True)
 class RuntimeConfig:
@@ -276,16 +280,28 @@ class RuntimeConfig:
 ```python
 TINY_PI0 = Pi0Config(
     vision=VisionConfig(
-        image_size=224, patch_size=14,
-        width=128, depth=2, mlp_dim=256, num_heads=4,
+        image_size=224,
+        patch_size=14,
+        width=128,
+        depth=2,
+        mlp_dim=256,
+        num_heads=4,
     ),
     paligemma=TransformerConfig(
-        width=128, depth=2, mlp_dim=256,
-        num_heads=4, num_kv_heads=1, head_dim=32,
+        width=128,
+        depth=2,
+        mlp_dim=256,
+        num_heads=4,
+        num_kv_heads=1,
+        head_dim=32,
     ),
     action_expert=TransformerConfig(
-        width=64, depth=2, mlp_dim=128,
-        num_heads=4, num_kv_heads=1, head_dim=32,
+        width=64,
+        depth=2,
+        mlp_dim=128,
+        num_heads=4,
+        num_kv_heads=1,
+        head_dim=32,
     ),
     action_dim=32,
     action_horizon=50,
@@ -372,9 +388,7 @@ TrainConfig(
         default_prompt="Transfer cube",
         use_delta_joint_actions=False,
     ),
-    weight_loader=CheckpointWeightLoader(
-        "gs://openpi-assets/checkpoints/pi0_base/params"
-    ),
+    weight_loader=CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
     num_train_steps=20_000,
 )
 ```
@@ -386,9 +400,7 @@ TrainConfig(
 `create_torch_dataset()` 读取 LeRobot metadata 中的 FPS，并为每个样本请求：
 
 ```python
-delta_timestamps = {
-    key: [t / fps for t in range(action_horizon)]
-}
+delta_timestamps = {key: [t / fps for t in range(action_horizon)]}
 ```
 
 因此单个时刻会配上未来 `action_horizon=50` 帧动作，而不是只学习下一步动作。这就是 action chunking 的数据来源。
@@ -555,7 +567,7 @@ uv run examples/convert_jax_model_to_pytorch.py \
 随后在复制出的自定义 `TrainConfig` 中设置：
 
 ```python
-pytorch_weight_path="./converted_checkpoints/pi0_base_pytorch"
+pytorch_weight_path = "./converted_checkpoints/pi0_base_pytorch"
 ```
 
 单卡/多卡训练入口分别是：
@@ -873,6 +885,20 @@ sample = {
 
 第一轮不要追求分布式和极致性能：先在 dummy 模型上 overfit 一个 batch，再在少量真实数据上 overfit 一个 episode，确认 loss 能显著下降且 checkpoint 恢复后完全连续，最后才上完整数据。
 
+本项目的 SO101 训练还遵守两条不可省略的数值约束：
+
+1. 从零初始化的 projection 和双专家参数、梯度、AdamW moments 必须保持 FP32；
+   RTX 4090 只通过 BF16 autocast 降低矩阵计算和 activation 成本。不要把可训练参数
+   本身直接转换成 BF16，否则 `1e-4` 以下的更新可能在写回权重时被舍入掉。
+2. 模型保留32维动作契约，但 SO101 只有前6维是真实关节。训练 loss、初始 flow
+   noise 和 Euler 更新都必须使用 action-dimension mask；后26维始终为0，不能让
+   padding 维主导 loss 或成为随机干扰输入。
+
+验证不能只记录 flow velocity MSE。当前训练器还会用固定随机种子运行完整动作采样，
+记录真实动作维的 action chunk MAE 和 first-action MAE，并逐步追加到
+`metrics.jsonl`。只有这些物理动作指标持续改善，checkpoint 才有进入离线安全验证的
+资格。
+
 ### 14.7 自研部署架构
 
 建议把部署拆成四层：
@@ -1083,7 +1109,7 @@ uv run scripts/train_pytorch.py <你的_pi0配置名> \
 其中自定义配置需要包含：
 
 ```python
-pytorch_weight_path="./converted_checkpoints/pi0_base_pytorch"
+pytorch_weight_path = "./converted_checkpoints/pi0_base_pytorch"
 ```
 
 完成这条官方 PyTorch 路线后，你获得的是可执行参考；完成第 14 节的独立 PyTorch 实现、参数加载和数值对齐后，才算真正具备端到端实现能力。这套能力也是后续 π0-FAST、π0.5 乃至其他 VLA 会复用的地基：统一 observation/action 契约、机器人数据适配、action chunk、条件生成、预训练权重迁移、归一化资产、checkpoint 和远程 policy serving。

@@ -12,8 +12,8 @@ class TrainingConfig:
     max_steps: int = 30_000
     micro_batch_size: int = 8
     gradient_accumulation_steps: int = 4
-    learning_rate: float = 2.5e-5
-    end_learning_rate: float = 2.5e-6
+    learning_rate: float = 1e-4
+    end_learning_rate: float = 1e-5
     warmup_steps: int = 1_000
     decay_steps: int = 30_000
     beta1: float = 0.9
@@ -24,11 +24,14 @@ class TrainingConfig:
     validation_fraction: float = 0.1
     validation_interval: int = 500
     validation_batches: int = 32
+    validation_action_batches: int = 1
+    validation_sampling_steps: int = 10
     checkpoint_interval: int = 1_000
     num_workers: int = 4
     seed: int = 42
     gradient_checkpointing: bool = False
     compile_model: bool = False
+    bfloat16_autocast: bool = True
 
     def __post_init__(self) -> None:
         positive_integer_fields = (
@@ -39,6 +42,8 @@ class TrainingConfig:
             "decay_steps",
             "validation_interval",
             "validation_batches",
+            "validation_action_batches",
+            "validation_sampling_steps",
             "checkpoint_interval",
         )
 
@@ -70,4 +75,7 @@ class TrainingConfig:
 
 SO101_4090_TRAINING = TrainingConfig(
     output_dir=Path("checkpoints/so101_recommended"),
+    micro_batch_size=4,
+    gradient_accumulation_steps=8,
+    gradient_checkpointing=True,
 )

@@ -53,7 +53,31 @@ uv run python -m scripts.inspect_so101_dataset
 uv run python -m scripts.smoke_real_policy
 ```
 
+上面的 smoke test 使用随机初始化的 decoder，只验证架构。训练结束后，应先解压
+deployment artifact，再对录制数据执行真实权重离线推理：
+
+```bash
+mkdir -p artifacts/pi0_so101_recommended_step10000
+tar -xzf artifacts/pi0_so101_recommended_step10000_deploy.tar.gz \
+  -C artifacts/pi0_so101_recommended_step10000
+
+uv run python -m scripts.infer_deploy_artifact \
+  --artifact-dir artifacts/pi0_so101_recommended_step10000 \
+  --num-steps 10 \
+  --sample-index 0 \
+  --output-json artifacts/pi0_so101_recommended_step10000/offline-actions.json
+```
+
+该脚本只读取一条已录制的双摄观测，严格加载模型与归一化参数并生成动作，不连接
+SO101，也不会发送电机指令。输出中的动作仅前6维属于当前SO101。脚本还会将预测
+首步与当前关节、录制动作进行比较；默认任一关节的首步变化超过10度就以非零状态
+退出并显示 `ready_for_hardware: false`。
+
 ## RTX 4090 训练验收
+
+训练器保持可训练参数和 AdamW 状态为 FP32，并在 CUDA 前向中使用 BF16 autocast；
+SO101 的 loss 和扩散噪声只作用于前6个真实动作维。不要从旧的 BF16-master
+checkpoint 恢复，应使用一个全新的输出目录：
 
 ```bash
 uv run python -m scripts.train_so101 \
@@ -65,10 +89,31 @@ uv run python -m scripts.train_so101 \
   --validation-interval 20 \
   --validation-batches 8 \
   --checkpoint-interval 50 \
-  --output-dir checkpoints/so101_4090_smoke
+  --output-dir checkpoints/so101_fp32_smoke
 ```
 
-断点恢复时使用相同参数并增加 `--resume`。
+100步验收通过后，正式训练建议：
+
+```bash
+uv run python -m scripts.train_so101 \
+  --profile recommended \
+  --max-steps 30000 \
+  --micro-batch-size 4 \
+  --gradient-accumulation-steps 8 \
+  --learning-rate 1e-4 \
+  --end-learning-rate 1e-5 \
+  --warmup-steps 1000 \
+  --validation-interval 500 \
+  --validation-batches 32 \
+  --validation-action-batches 1 \
+  --validation-sampling-steps 10 \
+  --checkpoint-interval 1000 \
+  --output-dir checkpoints/so101_fp32_v2
+```
+
+每一步指标追加到 `metrics.jsonl`；验证点同时记录 flow loss、真实6维动作块 MAE
+和首动作 MAE。断点恢复时必须使用同一组参数和同一个新格式目录，并增加
+`--resume`。训练器会拒绝旧 BF16-master checkpoint，避免静默继续无效训练。
 
 ## 文档
 

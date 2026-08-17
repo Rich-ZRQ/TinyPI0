@@ -15,6 +15,8 @@ class Pi0PrefixEmbedding(nn.Module):
         self,
         config: Pi0Config,
         prefix_encoder: PaliGemmaPrefixEncoder,
+        *,
+        projection_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
 
@@ -25,10 +27,13 @@ class Pi0PrefixEmbedding(nn.Module):
         target_width = config.paligemma.width
 
         reference_parameter = next(prefix_encoder.parameters())
-        target_dtype = {
-            "float32": torch.float32,
-            "bfloat16": torch.bfloat16,
-        }[config.dtype]
+        target_dtype = (
+            projection_dtype
+            or {
+                "float32": torch.float32,
+                "bfloat16": torch.bfloat16,
+            }[config.dtype]
+        )
 
         # 图像和文本共享一个映射，以尽量保留它们已经对齐的特征空间。
         self.input_projection = nn.Linear(

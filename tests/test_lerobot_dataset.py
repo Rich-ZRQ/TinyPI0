@@ -36,6 +36,7 @@ def test_training_batch_masks_padded_loss() -> None:
         observation=None,  # type: ignore[arg-type]
         actions=torch.empty(1, 3, 2),
         action_valid_mask=torch.tensor([[True, True, False]]),
+        action_dim_mask=torch.tensor([[True, True]]),
     )
 
     loss = batch.masked_mean_loss(torch.tensor([[1.0, 3.0, 100.0]]))
@@ -69,6 +70,8 @@ def test_dataset_maps_so101_and_pads_episode_tail(tmp_path: Path) -> None:
     assert torch.equal(sample.actions[0, :2], torch.tensor([30.0, 40.0]))
     assert torch.equal(sample.actions[-1, :2], torch.tensor([30.0, 40.0]))
     assert sample.action_valid_mask.sum().item() == 1
+    assert sample.action_dim_mask[:2].tolist() == [True, True]
+    assert not torch.any(sample.action_dim_mask[2:])
     assert sample.images["base_0_rgb"] is not None
     assert sample.images["left_wrist_0_rgb"] is not None
     assert sample.images["right_wrist_0_rgb"] is None

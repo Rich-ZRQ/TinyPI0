@@ -1,8 +1,10 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import load_file, save_file
 from torch import Tensor, nn
 
 from configs import TINY_PI0, TrainingConfig
@@ -74,6 +76,13 @@ def make_batch() -> Pi0TrainingBatch:
             ),
             dim=1,
         ),
+        action_dim_mask=torch.cat(
+            (
+                torch.ones(batch_size, 6, dtype=torch.bool),
+                torch.zeros(batch_size, TINY_PI0.action_dim - 6, dtype=torch.bool),
+            ),
+            dim=1,
+        ),
     )
 
 
@@ -139,6 +148,54 @@ def test_checkpoint_round_trip_only_restores_trainable_parameters(
     assert latest_checkpoint(tmp_path) == checkpoint_path
 
 
+def test_optimizer_rejects_bfloat16_master_parameters(tmp_path: Path) -> None:
+    model = nn.Linear(2, 2).to(torch.bfloat16)
+
+    with pytest.raises(TypeError, match="must remain FP32"):
+        create_optimizer(model, TrainingConfig(output_dir=tmp_path))
+
+
+def test_resume_rejects_legacy_bfloat16_master_checkpoint(tmp_path: Path) -> None:
+    model = nn.Linear(2, 2)
+    config = TrainingConfig(output_dir=tmp_path)
+    optimizer = create_optimizer(model, config)
+    checkpoint = save_checkpoint(
+        model=model,
+        optimizer=optimizer,
+        config=config,
+        step=1,
+    )
+    weights_path = checkpoint / "model.safetensors"
+    legacy_weights = {name: value.to(torch.bfloat16) for name, value in load_file(weights_path).items()}
+    save_file(legacy_weights, weights_path)
+
+    with pytest.raises(TypeError, match="legacy BF16-master"):
+        load_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            checkpoint_path=checkpoint,
+            device=torch.device("cpu"),
+        )
+
+
+def test_small_learning_rate_updates_fp32_master_parameter(tmp_path: Path) -> None:
+    parameter = nn.Parameter(torch.tensor([0.02], dtype=torch.float32))
+    model = nn.ParameterList([parameter])
+    optimizer = create_optimizer(
+        model,
+        TrainingConfig(
+            output_dir=tmp_path,
+            learning_rate=2.5e-5,
+            end_learning_rate=2.5e-6,
+        ),
+    )
+    before = parameter.detach().clone()
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+
+    assert not torch.equal(parameter, before)
+
+
 def test_trainer_runs_accumulation_validation_and_checkpoint(tmp_path: Path) -> None:
     policy = Pi0Policy(TINY_PI0, FakePrefixEncoder())
     batch = make_batch()
@@ -167,5 +224,14 @@ def test_trainer_runs_accumulation_validation_and_checkpoint(tmp_path: Path) -> 
     assert len(metrics) == 1
     assert metrics[0].step == 1
     assert metrics[0].validation_loss is not None
+    assert metrics[0].validation_action_mae is not None
+    assert metrics[0].validation_first_action_mae is not None
     assert torch.isfinite(torch.tensor(metrics[0].train_loss))
-    assert latest_checkpoint(tmp_path) is not None
+    checkpoint = latest_checkpoint(tmp_path)
+    assert checkpoint is not None
+    metadata = json.loads((checkpoint / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["trainable_dtype"] == "float32"
+    assert metadata["metrics"]["validation_action_mae"] is not None
+    metric_lines = (tmp_path / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(metric_lines) == 1
+    assert json.loads(metric_lines[0])["step"] == 1

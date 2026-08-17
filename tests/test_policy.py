@@ -203,6 +203,75 @@ def test_trainable_dtype_comes_from_model_config() -> None:
     assert next(policy.prefix_embedding.prefix_encoder.parameters()).dtype == torch.bfloat16
 
 
+def test_training_can_keep_master_parameters_float32() -> None:
+    encoder = FakePrefixEncoder().to(dtype=torch.bfloat16)
+    policy = Pi0Policy(
+        TINY_PI0,
+        encoder,
+        trainable_dtype=torch.float32,
+    )
+
+    assert all(parameter.dtype == torch.float32 for parameter in policy.parameters() if parameter.requires_grad)
+    assert next(policy.prefix_embedding.prefix_encoder.parameters()).dtype == torch.bfloat16
+
+
+def test_action_dimension_mask_excludes_robot_padding() -> None:
+    policy = Pi0Policy(TINY_PI0, FakePrefixEncoder())
+    observation = make_observation(batch_size=2)
+    actions = torch.zeros(2, TINY_PI0.action_horizon, TINY_PI0.action_dim)
+    dimension_mask = torch.zeros(2, TINY_PI0.action_dim, dtype=torch.bool)
+    dimension_mask[:, :6] = True
+
+    captured_noise = None
+
+    def fixed_element_loss(**kwargs: Tensor) -> Tensor:
+        nonlocal captured_noise
+        captured_noise = kwargs["noise"]
+        loss = torch.full_like(kwargs["actions"], 100.0)
+        loss[..., :6] = 2.0
+        return loss
+
+    policy.core.training_loss = fixed_element_loss
+    loss = policy.compute_loss(
+        observation,
+        actions,
+        action_dim_mask=dimension_mask,
+    )
+
+    assert torch.equal(loss, torch.full_like(loss, 2.0))
+    assert captured_noise is not None
+    assert torch.count_nonzero(captured_noise[..., 6:]) == 0
+
+
+def test_sampling_keeps_padding_dimensions_zero() -> None:
+    state_stats = NormStats(
+        mean=torch.zeros(6),
+        std=torch.ones(6),
+    )
+    action_stats = NormStats(
+        mean=torch.zeros(6),
+        std=torch.ones(6),
+    )
+    policy = Pi0Policy(
+        TINY_PI0,
+        FakePrefixEncoder(),
+        normalizer=Pi0Normalizer(state_stats, action_stats),
+    )
+    observation = make_observation(batch_size=1)
+
+    def predict_unit_velocity(**kwargs: Tensor) -> Tensor:
+        return torch.ones_like(kwargs["noisy_actions"])
+
+    policy.core.predict_velocity_with_cache = predict_unit_velocity
+    actions = policy.sample_actions(
+        observation,
+        num_steps=2,
+        noise=torch.ones(1, TINY_PI0.action_horizon, TINY_PI0.action_dim),
+    )
+
+    assert torch.count_nonzero(actions[..., 6:]) == 0
+
+
 def test_trainable_linears_use_gemma_initialization() -> None:
     torch.manual_seed(0)
     policy = Pi0Policy(TINY_PI0, FakePrefixEncoder())
